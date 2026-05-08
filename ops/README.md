@@ -13,6 +13,31 @@ Current services:
 
 - `wechat`: GenericAgent WeChat customer-service frontend, backed by `frontends/wechatapp.py` and the repo `.venv`.
 
+Helper commands:
+
+- `browser`: VNC Chromium helper, backed by `ops/vnc-browser`; it defaults to the real VNC display `:1` instead of an inherited SSH display such as `localhost:11.0`.
+- `feishu-qr`: Open the default Feishu login/QR page or a target Feishu app page in VNC Chromium.
+- `mumu-qr`: Shortcut alias for the Mumu AI Feishu app (`cli_a979473759f85bd6`).
+
+Browser examples:
+
+```bash
+# Show VNC/browser environment and selected display
+/home/ubuntu/tool/GenericAgent/ops/ga-service browser status
+
+# Open or reuse Chromium inside the VNC desktop
+/home/ubuntu/tool/GenericAgent/ops/ga-service browser open https://open.feishu.cn/app
+
+# Open Feishu login/QR page or the Mumu AI app page
+/home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr
+/home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr cli_a979473759f85bd6
+/home/ubuntu/tool/GenericAgent/ops/ga-service mumu-qr
+
+# List VNC windows or capture a screenshot for evidence
+/home/ubuntu/tool/GenericAgent/ops/ga-service browser list-windows
+/home/ubuntu/tool/GenericAgent/ops/ga-service browser screenshot temp/vnc-browser.png
+```
+
 Common commands:
 
 ```bash

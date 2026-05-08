@@ -283,3 +283,8 @@ class TMWebDriver:
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
