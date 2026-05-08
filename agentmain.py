@@ -11,7 +11,7 @@ from agent_loop import agent_runner_loop
 from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-from startup_guard import auto_create_usage_branch
+from startup_guard import auto_create_usage_branch, sync_main_if_safe
 
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA
@@ -195,6 +195,17 @@ if __name__ == '__main__':
             stdout=open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8'),
             stderr=open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8'))
         print(p.pid); sys.exit(0)
+
+    preflight = sync_main_if_safe(script_dir)
+    notes = preflight.get('notes', [])
+    if any(note.startswith('sync_main=ok') for note in notes):
+        print('[GA] main 已同步')
+    elif preflight.get('ok'):
+        print('[GA] main 同步检查完成')
+    else:
+        print('[GA] main 同步告警')
+    for note in notes:
+        print(f'[GA] {note}')
 
     auto_create_usage_branch(script_dir)
 

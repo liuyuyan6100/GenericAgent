@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# Standalone Chromium helper for the GenericAgent VNC desktop.
+# This script deliberately ignores an inherited SSH DISPLAY such as
+# localhost:11.0 unless --display is explicitly provided.
+
+set -u
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+  LINK_TARGET="$(readlink "$SCRIPT_PATH")"
+  case "$LINK_TARGET" in
+    /*) SCRIPT_PATH="$LINK_TARGET" ;;
+    *) SCRIPT_PATH="$SCRIPT_DIR/$LINK_TARGET" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
+
+DEFAULT_URL="https://open.feishu.cn/app"
+DEFAULT_PROFILE_DIR="$REPO_ROOT/temp/vnc-browser-profile"
+DEFAULT_CDP_PORT="9222"
+DEFAULT_SCREENSHOT="$REPO_ROOT/temp/vnc-browser-screenshot.png"
+
+BROWSER_DISPLAY="${GA_VNC_DISPLAY:-}"
+PROFILE_DIR="${GA_VNC_BROWSER_PROFILE:-$DEFAULT_PROFILE_DIR}"
+CDP_PORT="${GA_VNC_BROWSER_CDP_PORT:-$DEFAULT_CDP_PORT}"
+BROWSER_BIN="${GA_VNC_BROWSER_BIN:-}"
+
+log() { printf '[vnc-browser] %s\n' "$*"; }
+err() { printf '[vnc-browser][ERROR] %s\n' "$*" >&2; }
+
+usage() {
+  cat <<USAGE
+Usage:
+  vnc-browser [global-options] <command> [args]
+
+Global options:
+  --display DISPLAY       X display to use, e.g. :1. Default auto-detects local VNC displays.
+  --profile-dir DIR       Chromium profile directory. Default: $DEFAULT_PROFILE_DIR
+  --cdp-port PORT         Chromium remote-debugging port. Default: $DEFAULT_CDP_PORT
+  --browser-bin PATH      Chromium executable. Default: chromium-browser/chromium/google-chrome from PATH.
+  -h, --help              Show this help.
+
+Commands:
+  open [URL]              Open URL in the VNC Chromium. Default: $DEFAULT_URL
+  status                  Print detected display, VNC/noVNC ports, Chromium/CDP status.
+  list-windows            List visible X windows on the selected VNC display.
+  screenshot [FILE]       Capture the selected VNC display to PNG. Default: $DEFAULT_SCREENSHOT
+  help                    Show this help.
+
+Examples:
+  /home/ubuntu/tool/GenericAgent/ops/vnc-browser status
+  /home/ubuntu/tool/GenericAgent/ops/vnc-browser open https://open.feishu.cn/app
+  GA_VNC_DISPLAY=:1 /home/ubuntu/tool/GenericAgent/ops/vnc-browser list-windows
+USAGE
+}
+
+is_local_display() {
+  case "${1:-}" in
+    :[0-9]*|unix:[0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+x_socket_for_display() {
+  d="${1:-}"
+  d="${d#unix}"
+  d="${d#:}"
+  d="${d%%.*}"
+  printf '/tmp/.X11-unix/X%s\n' "$d"
+}
+
+can_use_display() {
+  d="${1:-}"
+  [ -n "$d" ] || return 1
+  sock="$(x_socket_for_display "$d")"
+  [ -S "$sock" ] || return 1
+  DISPLAY="$d" xdpyinfo >/dev/null 2>&1
+}
+
+detect_display() {
+  if [ -n "${BROWSER_DISPLAY:-}" ]; then
+    printf '%s\n' "$BROWSER_DISPLAY"
+    return 0
+  fi
+
+  # Prefer the active noVNC/TigerVNC desktop. Do not inherit SSH-forwarded DISPLAY.
+  for d in :1 :0 :2 :3 :4 :5; do
+    if can_use_display "$d"; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+
+  if is_local_display "${DISPLAY:-}" && can_use_display "$DISPLAY"; then
+    printf '%s\n' "$DISPLAY"
+    return 0
+  fi
+
+  return 1
+}
+
+require_display() {
+  d="$(detect_display 2>/dev/null || true)"
+  if [ -z "$d" ]; then
+    err "No usable local X/VNC display found. Expected a socket such as /tmp/.X11-unix/X1."
+    return 1
+  fi
+  if ! can_use_display "$d"; then
+    err "Display exists but is not usable: $d"
+    err "Try: GA_VNC_DISPLAY=:1 $SCRIPT_PATH status"
+    return 1
+  fi
+  printf '%s\n' "$d"
+}
+
+allow_display_local_user() {
+  d="${1:-}"
+  [ -n "$d" ] || return 0
+  if command -v xhost >/dev/null 2>&1; then
+    # Snap Chromium may not be able to read ~/.Xauthority; allow only this local Unix user.
+    DISPLAY="$d" xhost "+SI:localuser:$(id -un)" >/dev/null 2>&1 || true
+  fi
+}
+
+browser_bin() {
+  if [ -n "${BROWSER_BIN:-}" ]; then
+    printf '%s\n' "$BROWSER_BIN"
+    return 0
+  fi
+  for c in chromium-browser chromium google-chrome google-chrome-stable; do
+    if command -v "$c" >/dev/null 2>&1; then
+      command -v "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+port_is_listening() {
+  port="${1:-}"
+  [ -n "$port" ] || return 1
+  # ss -tln may return exit code 0 even when empty; grep ensures we matched.
+  ss -tln 2>/dev/null | awk -v p=":$port" '$4 ~ p {found=1} END{exit !found}'
+}
+
+cdp_json() {
+  # Quick probe: if something answers on the CDP port, return its /json body.
+  port="${1:-$CDP_PORT}"
+  python3 - "$port" <<'PY'
+import sys, socket, json
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(('127.0.0.1', port))
+    s.sendall(b'GET /json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n')
+    data = b''
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    body = data.split(b'\\r\\n\\r\\n', 1)[1]
+    sys.stdout.buffer.write(body)
+    sys.exit(0)
+finally:
+    s.close()
+PY
+}
+
+find_free_cdp_port() {
+  preferred="${1:-$DEFAULT_CDP_PORT}"
+  for p in "$preferred" 9333 9223 9224 9225 9226 9227 9228 9229 9230 9231 9232 9233 9234 9235; do
+    if ! port_is_listening "$p"; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+visible_browser_windows() {
+  d="${1:-}"
+  [ -n "$d" ] || return 1
+  if command -v wmctrl >/dev/null 2>&1; then
+    DISPLAY="$d" wmctrl -lx 2>/dev/null | grep -Ei 'chromium|google-chrome|chrome' || true
+  elif command -v xdotool >/dev/null 2>&1; then
+    DISPLAY="$d" xdotool search --onlyvisible --class 'chromium|google-chrome|chrome' getwindowname %@ 2>/dev/null || true
+  fi
+}
+
+visible_browser_window_pids() {
+  d="${1:-}"
+  [ -n "$d" ] || return 1
+  if command -v wmctrl >/dev/null 2>&1; then
+    DISPLAY="$d" wmctrl -lxp 2>/dev/null \
+      | awk 'BEGIN{IGNORECASE=1} /chromium|google-chrome|chrome/ && $3 ~ /^[0-9]+$/ {print $3}' \
+      | sort -u
+  fi
+}
+
+cdp_listener_pids() {
+  port="${1:-$CDP_PORT}"
+  # Try ss first; on some systems it needs root for PID info.
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null \
+      | awk -v port=":$port" '$4 ~ port {print}' \
+      | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p'
+  fi
+  # Fallback to lsof.
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true
+  fi
+  # Fallback to netstat.
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -tlnp 2>/dev/null \
+      | awk -v port=":$port" '$4 ~ port {print}' \
+      | sed -n 's/.*\/\([0-9][0-9]*\).*/\1/p'
+  fi
+}
+
+cdp_visible_on_display() {
+  d="${1:-}"
+  port="${2:-$CDP_PORT}"
+  [ -n "$d" ] || return 1
+  listener_pids="$(cdp_listener_pids "$port" | sort -u | tr '\n' ' ')"
+  window_pids="$(visible_browser_window_pids "$d" | sort -u | tr '\n' ' ')"
+  [ -n "$listener_pids" ] && [ -n "$window_pids" ] || return 1
+  for lp in $listener_pids; do
+    for wp in $window_pids; do
+      [ "$lp" = "$wp" ] && return 0
+    done
+  done
+  return 1
+}
+
+browser_visible_on_display() {
+  [ -n "$(visible_browser_windows "${1:-}")" ]
+}
+
+open_via_cdp_if_available() {
+  url="$1"
+  d="${2:-}"
+  if [ -z "$(cdp_json)" ]; then
+    return 1
+  fi
+  if [ -n "$d" ] && ! cdp_visible_on_display "$d" "$CDP_PORT"; then
+    log "CDP port $CDP_PORT is up, but its listener PID is not a visible Chromium window on DISPLAY=$d; not reusing it."
+    return 1
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    encoded="$(python3 - "$url" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=':/?#[]@!$&\'()*+,;='))
+PY
+)"
+    # /json/new requires PUT on newer Chromium.
+    curl -fsS --max-time 5 -X PUT "http://127.0.0.1:$CDP_PORT/json/new?$encoded" >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
+open_via_recorded_cdp_if_available() {
+  url="$1"
+  d="${2:-}"
+  port_file="$REPO_ROOT/temp/run/vnc-browser.cdp-port"
+  [ -r "$port_file" ] || return 1
+  recorded_port="$(head -n 1 "$port_file" 2>/dev/null | tr -d '[:space:]')"
+  case "$recorded_port" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$recorded_port" != "$CDP_PORT" ] || return 1
+
+  saved_port="$CDP_PORT"
+  CDP_PORT="$recorded_port"
+  if open_via_cdp_if_available "$url" "$d"; then
+    log "Opened via recorded visible CDP port $CDP_PORT on DISPLAY=$d: $url"
+    return 0
+  fi
+  CDP_PORT="$saved_port"
+  return 1
+}
+
+status_cmd() {
+  d="$(detect_display 2>/dev/null || true)"
+  printf 'repo_root=%s\n' "$REPO_ROOT"
+  printf 'selected_display=%s\n' "${d:-<none>}"
+  printf 'inherited_DISPLAY=%s\n' "${DISPLAY:-<unset>}"
+  printf 'profile_dir=%s\n' "$PROFILE_DIR"
+  printf 'cdp_port=%s\n' "$CDP_PORT"
+  if [ -n "$d" ]; then
+    sock="$(x_socket_for_display "$d")"
+    printf 'x_socket=%s exists=%s\n' "$sock" "$([ -S "$sock" ] && echo yes || echo no)"
+    if can_use_display "$d"; then
+      printf 'display_usable=yes\n'
+      DISPLAY="$d" xdpyinfo 2>/dev/null | awk '/dimensions:/{print "dimensions="$2; exit}' || true
+    else
+      printf 'display_usable=no\n'
+    fi
+  else
+    printf 'display_usable=no\n'
+  fi
+
+  if bin="$(browser_bin 2>/dev/null)"; then
+    printf 'browser_bin=%s\n' "$bin"
+  else
+    printf 'browser_bin=<not-found>\n'
+  fi
+
+  # Metadata only: process command lines are useful for ops, no secrets expected.
+  ps -eo pid=,ppid=,stat=,etime=,args= | grep -Ei 'chromium|chrome' | grep -v grep | sed 's/^/browser_process=/' | head -n 20 || true
+
+  if json="$(cdp_json)"; [ -n "$json" ]; then
+    printf 'cdp_status=up\n'
+    printf '%s\n' "$json" | python3 - <<'PY' 2>/dev/null || true
+import sys,json
+data=sys.stdin.read()
+try:
+    tabs=json.loads(data)
+except Exception:
+    tabs=[]
+for i,t in enumerate(tabs[:20]):
+    print(f"cdp_tab_{i}=type:{t.get('type')} title:{t.get('title')!r} url:{t.get('url')!r}")
+PY
+  else
+    printf 'cdp_status=down\n'
+  fi
+
+  (ss -ltnp 2>/dev/null || true) | grep -E ':(5900|5901|6080|6901|8788|9222)\b' | sed 's/^/listen=/' || true
+}
+
+list_windows_cmd() {
+  d="$(require_display)" || return $?
+  printf 'display=%s\n' "$d"
+  if command -v wmctrl >/dev/null 2>&1; then
+    DISPLAY="$d" wmctrl -l 2>/dev/null || true
+  elif command -v xdotool >/dev/null 2>&1; then
+    DISPLAY="$d" xdotool search --onlyvisible --name . getwindowname %@ 2>/dev/null || true
+  else
+    err "wmctrl/xdotool not found; cannot list windows."
+    return 1
+  fi
+}
+
+screenshot_cmd() {
+  file="${1:-$DEFAULT_SCREENSHOT}"
+  d="$(require_display)" || return $?
+  mkdir -p "$(dirname "$file")"
+
+  if command -v import >/dev/null 2>&1; then
+    DISPLAY="$d" import -window root "$file"
+  elif command -v scrot >/dev/null 2>&1; then
+    DISPLAY="$d" scrot "$file"
+  elif command -v xfce4-screenshooter >/dev/null 2>&1; then
+    DISPLAY="$d" xfce4-screenshooter --fullscreen --save "$file"
+  elif command -v ffmpeg >/dev/null 2>&1; then
+    dim="$(DISPLAY="$d" xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}')"
+    if [ -z "$dim" ]; then
+      err "Cannot detect display dimensions for ffmpeg screenshot."
+      return 1
+    fi
+    DISPLAY="$d" ffmpeg -nostdin -y -loglevel error \
+      -f x11grab -video_size "$dim" -i "$d" \
+      -frames:v 1 -update 1 "$file"
+  else
+    err "No supported screenshot tool found (tried ImageMagick import, scrot, xfce4-screenshooter, ffmpeg)."
+    return 1
+  fi
+
+  if [ ! -s "$file" ]; then
+    err "Screenshot command completed but output is missing or empty: $file"
+    return 1
+  fi
+  printf 'screenshot=%s\n' "$file"
+}
+
+open_cmd() {
+  url="${1:-$DEFAULT_URL}"
+  d="$(require_display)" || return $?
+  allow_display_local_user "$d"
+  bin="$(browser_bin 2>/dev/null || true)"
+  if [ -z "$bin" ]; then
+    err "Chromium executable not found in PATH."
+    return 1
+  fi
+  mkdir -p "$PROFILE_DIR" "$REPO_ROOT/temp/run"
+
+  if open_via_cdp_if_available "$url" "$d"; then
+    log "Opened via visible existing CDP port $CDP_PORT on DISPLAY=$d: $url"
+  else
+    launch_port="$CDP_PORT"
+    if port_is_listening "$launch_port"; then
+      if launch_port="$(find_free_cdp_port "$launch_port")"; then
+        log "CDP port $CDP_PORT is occupied and not reusable on DISPLAY=$d; using free port $launch_port."
+      else
+        err "CDP port $CDP_PORT is occupied and no fallback port is free."
+        return 1
+      fi
+    fi
+    CDP_PORT="$launch_port"
+    DISPLAY="$d" nohup "$bin" \
+      --no-sandbox \
+      --disable-dev-shm-usage \
+      --start-maximized \
+      --new-window \
+      --remote-debugging-address=127.0.0.1 \
+      --remote-debugging-port="$CDP_PORT" \
+      --user-data-dir="$PROFILE_DIR" \
+      "$url" >>"$REPO_ROOT/temp/vnc-browser.log" 2>&1 &
+    pid="$!"
+    printf '%s\n' "$pid" > "$REPO_ROOT/temp/run/vnc-browser.pid"
+    printf '%s\n' "$CDP_PORT" > "$REPO_ROOT/temp/run/vnc-browser.cdp-port"
+    log "Started Chromium on DISPLAY=$d pid=$pid cdp_port=$CDP_PORT url=$url"
+    log "Log: $REPO_ROOT/temp/vnc-browser.log"
+  fi
+
+  # Give the window manager a moment, then show evidence.
+  sleep 2
+  status_cmd | sed 's/^/[status] /'
+  list_windows_cmd | sed 's/^/[window] /'
+}
+
+# Parse global options before command.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --display) shift; BROWSER_DISPLAY="${1:-}"; shift || true ;;
+    --display=*) BROWSER_DISPLAY="${1#*=}"; shift ;;
+    --profile-dir) shift; PROFILE_DIR="${1:-}"; shift || true ;;
+    --profile-dir=*) PROFILE_DIR="${1#*=}"; shift ;;
+    --cdp-port) shift; CDP_PORT="${1:-}"; shift || true ;;
+    --cdp-port=*) CDP_PORT="${1#*=}"; shift ;;
+    --browser-bin) shift; BROWSER_BIN="${1:-}"; shift || true ;;
+    --browser-bin=*) BROWSER_BIN="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1"; usage; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+cmd="${1:-help}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+  open) open_cmd "${1:-$DEFAULT_URL}" ;;
+  status) status_cmd ;;
+  list-windows|windows) list_windows_cmd ;;
+  screenshot) screenshot_cmd "${1:-$DEFAULT_SCREENSHOT}" ;;
+  help|-h|--help) usage ;;
+  *) err "Unknown command: $cmd"; usage; exit 2 ;;
+esac

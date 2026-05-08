@@ -26,12 +26,24 @@ usage() {
 Usage:
   ga-service [service] <command> [args]
   ga-service <command> [args]              # defaults to service: $DEFAULT_SERVICE
+  ga-service browser <command> [args]      # delegate to ops/vnc-browser
+  ga-service feishu-qr [app_id|url]        # open Feishu login/app page in VNC Chromium
+  ga-service mumu-qr                       # open Mumu AI Feishu app page in VNC Chromium
 
 Services:
   wechat        GA WeChat customer-service frontend (frontends/wechatapp.py)
+  tmwd          TMWebDriver master for browser/CDP bridge (TMWebDriver.py)
+
+Helpers:
+  browser       VNC Chromium helper (open/status/list-windows/screenshot)
+  feishu-qr     Open Feishu QR login or target app page in VNC Chromium
+  mumu-qr       Open Mumu AI Feishu app page in VNC Chromium
 
 Commands:
   list                                  Show manageable services
+  browser <command> [args]              Control the VNC Chromium helper
+  feishu-qr [app_id|url]                Open Feishu login or target app page
+  mumu-qr                               Open Mumu AI Feishu app page
   start [service]                       Start service in background
   stop [service]                        Stop service using verified PID/process match
   restart [service]                     Restart service
@@ -44,8 +56,15 @@ Commands:
 
 Examples:
   /home/ubuntu/tool/GenericAgent/ops/ga-service wechat start
+  /home/ubuntu/tool/GenericAgent/ops/ga-service tmwd start
   /home/ubuntu/tool/GenericAgent/ops/ga-service status
+  /home/ubuntu/tool/GenericAgent/ops/ga-service browser status
+  /home/ubuntu/tool/GenericAgent/ops/ga-service browser open https://open.feishu.cn/app
+  /home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr
+  /home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr cli_a979473759f85bd6
+  /home/ubuntu/tool/GenericAgent/ops/ga-service mumu-qr
   ga-service wechat restart             # after install-bin
+  ga-service tmwd status
   ga-service logs -n 100
   ga-service qr
 USAGE
@@ -61,6 +80,7 @@ ensure_dirs() {
 service_label() {
   case "$1" in
     wechat) printf '%s\n' 'GA WeChat frontend' ;;
+    tmwd) printf '%s\n' 'TMWebDriver master' ;;
     *) return 1 ;;
   esac
 }
@@ -68,6 +88,7 @@ service_label() {
 service_script_abs() {
   case "$1" in
     wechat) printf '%s\n' "$REPO_ROOT/frontends/wechatapp.py" ;;
+    tmwd) printf '%s\n' "$REPO_ROOT/TMWebDriver.py" ;;
     *) return 1 ;;
   esac
 }
@@ -75,6 +96,7 @@ service_script_abs() {
 service_workdir() {
   case "$1" in
     wechat) printf '%s\n' "$REPO_ROOT" ;;
+    tmwd) printf '%s\n' "$REPO_ROOT" ;;
     *) return 1 ;;
   esac
 }
@@ -82,6 +104,7 @@ service_workdir() {
 service_python() {
   case "$1" in
     wechat) printf '%s\n' "$REPO_ROOT/.venv/bin/python" ;;
+    tmwd) printf '%s\n' "$REPO_ROOT/.venv/bin/python" ;;
     *) return 1 ;;
   esac
 }
@@ -89,6 +112,7 @@ service_python() {
 service_runner_log() {
   case "$1" in
     wechat) printf '%s\n' "$REPO_ROOT/temp/wechatapp.runner.log" ;;
+    tmwd) printf '%s\n' "$REPO_ROOT/temp/tmwebdriver.runner.log" ;;
     *) return 1 ;;
   esac
 }
@@ -96,6 +120,7 @@ service_runner_log() {
 service_app_log() {
   case "$1" in
     wechat) printf '%s\n' "$REPO_ROOT/temp/wechatapp.log" ;;
+    tmwd) printf '%s\n' "$REPO_ROOT/temp/tmwebdriver.app.log" ;;
     *) return 1 ;;
   esac
 }
@@ -103,6 +128,7 @@ service_app_log() {
 service_pidfile() {
   case "$1" in
     wechat) printf '%s\n' "$RUN_DIR/wechat.pid" ;;
+    tmwd) printf '%s\n' "$RUN_DIR/tmwd.pid" ;;
     *) return 1 ;;
   esac
 }
@@ -110,13 +136,14 @@ service_pidfile() {
 service_rel_script() {
   case "$1" in
     wechat) printf '%s\n' 'frontends/wechatapp.py' ;;
+    tmwd) printf '%s\n' 'TMWebDriver.py' ;;
     *) return 1 ;;
   esac
 }
 
 require_service() {
   case "${1:-}" in
-    wechat) return 0 ;;
+    wechat|tmwd) return 0 ;;
     ''|help|-h|--help) return 1 ;;
     *) err "Unknown service: $1"; return 1 ;;
   esac
@@ -272,6 +299,24 @@ status_service() {
   printf 'repo_root=%s\n' "$REPO_ROOT"
   printf 'runner_log=%s\n' "$runner_log"
   printf 'app_log=%s\n' "$app_log"
+  if [ -f "$REPO_ROOT/startup_guard.py" ]; then
+    py="$REPO_ROOT/.venv/bin/python"
+    if [ ! -x "$py" ]; then py="python3"; fi
+    (
+      cd "$REPO_ROOT" || exit 0
+      "$py" startup_guard.py repo-status --repo-root "$REPO_ROOT"
+    ) || {
+      printf 'repo_status_begin\n'
+      printf 'repo_status_error=command_failed\n'
+      printf 'repo_ok=no\n'
+      printf 'repo_status_end\n'
+    }
+  else
+    printf 'repo_status_begin\n'
+    printf 'repo_status_error=startup_guard_missing path=%s\n' "$REPO_ROOT/startup_guard.py"
+    printf 'repo_ok=no\n'
+    printf 'repo_status_end\n'
+  fi
   if [ "$svc" = "wechat" ]; then
     qr="$HOME/.wxbot/wx_qr.png"
     token="$HOME/.wxbot/token.json"
@@ -368,6 +413,106 @@ PY
 
 list_services() {
   printf 'wechat\t%s\n' "$(service_label wechat)"
+  printf 'tmwd\t%s\n' "$(service_label tmwd)"
+}
+
+browser_helper() {
+  helper="$REPO_ROOT/ops/vnc-browser"
+  if [ ! -x "$helper" ]; then
+    err "Browser helper not found/executable: $helper"
+    return 1
+  fi
+  "$helper" "$@"
+}
+
+feishu_qr_cmd() {
+  default_url="https://accounts.feishu.cn/accounts/page/login"
+  app_id=""
+  url=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --app)
+        shift
+        [ "$#" -gt 0 ] || { err "Missing value for --app"; return 2; }
+        app_id="$1"
+        ;;
+      --app=*)
+        app_id="${1#*=}"
+        [ -n "$app_id" ] || { err "Missing value for --app"; return 2; }
+        ;;
+      --url)
+        shift
+        [ "$#" -gt 0 ] || { err "Missing value for --url"; return 2; }
+        url="$1"
+        ;;
+      --url=*)
+        url="${1#*=}"
+        [ -n "$url" ] || { err "Missing value for --url"; return 2; }
+        ;;
+      http://*|https://*)
+        url="$1"
+        ;;
+      cli_*)
+        app_id="$1"
+        ;;
+      -h|--help)
+        cat <<EOF
+Usage:
+  ga-service feishu-qr
+  ga-service feishu-qr APP_ID
+  ga-service feishu-qr URL
+  ga-service feishu-qr --app APP_ID
+  ga-service feishu-qr --url URL
+
+Behavior:
+  No args        Open the default Feishu login/QR page
+  APP_ID         Open https://open.feishu.cn/app/APP_ID
+  URL            Open the provided URL as-is in VNC Chromium
+EOF
+        return 0
+        ;;
+      *)
+        err "Unknown feishu-qr target: $1"
+        return 2
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -n "$url" ]; then
+    resolved="$url"
+  elif [ -n "$app_id" ]; then
+    resolved="https://open.feishu.cn/app/$app_id"
+  else
+    resolved="$default_url"
+  fi
+
+  log "Opening Feishu page in VNC Chromium: $resolved"
+  browser_helper open "$resolved"
+}
+
+mumu_qr_cmd() {
+  if [ "$#" -gt 0 ]; then
+    case "$1" in
+      -h|--help)
+        cat <<EOF
+Usage:
+  ga-service mumu-qr
+
+Behavior:
+  Open the Mumu AI Feishu app page in VNC Chromium:
+  https://open.feishu.cn/app/cli_a979473759f85bd6
+EOF
+        return 0
+        ;;
+      *)
+        err "mumu-qr does not accept arguments"
+        return 2
+        ;;
+    esac
+  fi
+  feishu_qr_cmd cli_a979473759f85bd6
 }
 
 install_bin() {
@@ -477,6 +622,9 @@ main() {
   case "$first" in
     help|-h|--help) usage; return 0 ;;
     list) list_services; return 0 ;;
+    browser) shift; browser_helper "$@"; return $? ;;
+    feishu-qr) shift; feishu_qr_cmd "$@"; return $? ;;
+    mumu-qr) shift; mumu_qr_cmd "$@"; return $? ;;
     install-bin) shift; install_bin "$@"; return $? ;;
     uninstall-bin) shift; uninstall_bin "$@"; return $? ;;
   esac
@@ -509,7 +657,7 @@ main() {
     stop) stop_service "$svc" ;;
     restart) restart_service "$svc" ;;
     status)
-      if [ "$svc" = "all" ]; then status_service wechat; else status_service "$svc"; fi
+      if [ "$svc" = "all" ]; then status_service wechat; printf '\n'; status_service tmwd; else status_service "$svc"; fi
       ;;
     logs) logs_service "$svc" "$@" ;;
     qr) qr_service "$svc" ;;
