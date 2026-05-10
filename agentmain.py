@@ -11,7 +11,13 @@ from agent_loop import agent_runner_loop
 from ga import GenericAgentHandler, smart_format, get_global_memory, format_error, consume_file
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-from startup_guard import auto_create_usage_branch, sync_main_if_safe
+from startup_guard import (
+    auto_create_usage_branch,
+    latest_develop_main_record,
+    session_branch_advice,
+    sync_develop_with_main_if_safe,
+    sync_main_if_safe,
+)
 
 def load_tool_schema(suffix=''):
     global TOOLS_SCHEMA
@@ -170,7 +176,14 @@ class GenericAgent:
                 self.task_queue.task_done()
                 if self.handler is not None: self.handler.code_stop_signal.append(1)
 
-GeneraticAgent = GenericAgent    
+GeneraticAgent = GenericAgent
+
+
+def _print_preflight(title_ok, title_warn, result):
+    notes = result.get('notes', [])
+    print(title_ok if result.get('ok') else title_warn)
+    for note in notes:
+        print(f'[GA] {note}')
 
 if __name__ == '__main__':
     import argparse
@@ -194,18 +207,20 @@ if __name__ == '__main__':
             stderr=open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8'))
         print(p.pid); sys.exit(0)
 
-    preflight = sync_main_if_safe(script_dir)
-    notes = preflight.get('notes', [])
-    if any(note.startswith('sync_main=ok') for note in notes):
-        print('[GA] main 已同步')
-    elif preflight.get('ok'):
-        print('[GA] main 同步检查完成')
-    else:
-        print('[GA] main 同步告警')
-    for note in notes:
+    main_preflight = sync_main_if_safe(script_dir)
+    _print_preflight('[GA] main 同步检查完成', '[GA] main 同步告警', main_preflight)
+
+    develop_preflight = sync_develop_with_main_if_safe(script_dir, push=True)
+    _print_preflight('[GA] develop 同步检查完成', '[GA] develop 同步告警', develop_preflight)
+
+    branch_advice = session_branch_advice(script_dir)
+    for note in branch_advice.get('notes', []):
         print(f'[GA] {note}')
 
-    auto_create_usage_branch(script_dir)
+    if branch_advice.get('allow_auto_session'):
+        auto_create_usage_branch(script_dir)
+    else:
+        print('[GA] auto_session=skip reason=branch_policy')
 
     agent = GeneraticAgent()
     agent.next_llm(args.llm_no)

@@ -45,6 +45,48 @@ def _preferred_main_remote(repo_root='.'):
     return None
 
 
+def _origin_remote(repo_root='.'):
+    return "origin" if _remote_exists("origin", repo_root=repo_root) else None
+
+
+def _preferred_main_ref(repo_root='.'):
+    if _branch_exists("main", repo_root=repo_root):
+        return "main"
+    remote = _preferred_main_remote(repo_root=repo_root)
+    if remote:
+        remote_ref = f"{remote}/main"
+        if _remote_ref_exists(remote_ref, repo_root=repo_root):
+            return remote_ref
+    return None
+
+
+def _branch_ref(name):
+    return f"refs/heads/{name}"
+
+
+def _short_commit(ref, repo_root='.'):
+    return _git_output(["log", "-1", "--format=%h %ci %s", ref], repo_root=repo_root)
+
+
+def _count_commits(left, right, repo_root='.'):
+    out = _git_output(["rev-list", "--count", f"{left}..{right}"], repo_root=repo_root)
+    return int(out or "0")
+
+
+def _merge_in_progress(repo_root='.'):
+    result = _run_git(["rev-parse", "--git-path", "MERGE_HEAD"], repo_root=repo_root)
+    if result.returncode != 0:
+        return False
+    from pathlib import Path
+    return Path(repo_root, result.stdout.strip()).exists()
+
+
+def _append_stderr(notes, key, completed):
+    stderr = (getattr(completed, "stderr", None) or "").strip()
+    if stderr:
+        notes.append(f"{key}={stderr}")
+
+
 def get_current_branch(repo_root='.'):
     return _git_output(["rev-parse", "--abbrev-ref", "HEAD"], repo_root=repo_root)
 
@@ -161,6 +203,170 @@ def sync_main_if_safe(repo_root='.'):
     return result
 
 
+def latest_develop_main_record(repo_root='.'):
+    result = {"ok": True, "notes": []}
+    notes = result["notes"]
+    try:
+        if not _branch_exists("develop", repo_root=repo_root):
+            notes.append("develop_record=skip reason=no_local_develop")
+            return result
+        main_ref = _preferred_main_ref(repo_root=repo_root)
+        if not main_ref:
+            notes.append("develop_record=skip reason=no_main_ref")
+            return result
+
+        notes.append(f"develop_tip={_short_commit('develop', repo_root=repo_root)}")
+        notes.append(f"main_ref={main_ref}")
+        notes.append(f"main_tip={_short_commit(main_ref, repo_root=repo_root)}")
+        base = _git_output(["merge-base", "develop", main_ref], repo_root=repo_root)
+        notes.append(f"develop_latest_main_merge_base={_short_commit(base, repo_root=repo_root)}")
+        ahead = _count_commits(main_ref, "develop", repo_root=repo_root)
+        behind = _count_commits("develop", main_ref, repo_root=repo_root)
+        notes.append(f"develop_vs_main=ahead:{ahead} behind:{behind}")
+    except subprocess.CalledProcessError as e:
+        result["ok"] = False
+        notes.append(f"develop_record=warn reason=git_error code={e.returncode}")
+        if e.stderr:
+            notes.append(f"develop_record_stderr={e.stderr.strip()}")
+    except FileNotFoundError:
+        result["ok"] = False
+        notes.append("develop_record=warn reason=git_not_found")
+    return result
+
+
+def _restore_branch(repo_root, target_branch, notes, result, prefix):
+    checkout_back = _run_git(["checkout", target_branch], repo_root=repo_root)
+    if checkout_back.returncode == 0:
+        notes.append(f"{prefix}_restored_branch={target_branch}")
+        return True
+    result["ok"] = False
+    notes.append(f"{prefix}_restore_branch=warn target={target_branch} code={checkout_back.returncode}")
+    _append_stderr(notes, f"{prefix}_restore_stderr", checkout_back)
+    return False
+
+
+def sync_develop_with_main_if_safe(repo_root='.', push=True):
+    result = {"ok": True, "notes": []}
+    notes = result["notes"]
+    switched = False
+    current_branch = None
+    try:
+        current_branch = get_current_branch(repo_root=repo_root)
+        clean = is_worktree_clean(repo_root=repo_root)
+        notes.append(f"develop_sync_current_branch={current_branch}")
+        notes.append(f"develop_sync_worktree_clean={'yes' if clean else 'no'}")
+
+        if not clean:
+            notes.append("sync_develop=skip reason=dirty_worktree")
+            notes.extend(latest_develop_main_record(repo_root=repo_root).get("notes", []))
+            return result
+        if not _branch_exists("develop", repo_root=repo_root):
+            notes.append("sync_develop=skip reason=no_local_develop")
+            return result
+        main_ref = _preferred_main_ref(repo_root=repo_root)
+        if not main_ref:
+            notes.append("sync_develop=skip reason=no_main_ref")
+            return result
+
+        if current_branch != "develop":
+            checkout_develop = _run_git(["checkout", "develop"], repo_root=repo_root)
+            if checkout_develop.returncode != 0:
+                result["ok"] = False
+                notes.append(f"sync_develop=warn reason=checkout_develop_failed code={checkout_develop.returncode}")
+                _append_stderr(notes, "checkout_develop_stderr", checkout_develop)
+                return result
+            switched = True
+
+        merge = _run_git(["merge", "--no-edit", main_ref], repo_root=repo_root)
+        if merge.returncode != 0:
+            result["ok"] = False
+            notes.append(f"sync_develop=warn reason=merge_main_ref_failed source={main_ref} code={merge.returncode}")
+            _append_stderr(notes, "merge_develop_stderr", merge)
+            if _merge_in_progress(repo_root=repo_root):
+                abort = _run_git(["merge", "--abort"], repo_root=repo_root)
+                if abort.returncode == 0:
+                    notes.append("sync_develop_merge_abort=ok")
+                else:
+                    notes.append(f"sync_develop_merge_abort=warn code={abort.returncode}")
+                    _append_stderr(notes, "merge_abort_stderr", abort)
+            return result
+
+        notes.append(f"sync_develop=ok source={main_ref}")
+        stdout = (merge.stdout or "").strip()
+        if stdout:
+            notes.append(f"merge_develop_stdout={stdout}")
+        notes.extend(latest_develop_main_record(repo_root=repo_root).get("notes", []))
+
+        if push:
+            origin = _origin_remote(repo_root=repo_root)
+            if not origin:
+                notes.append("push_develop=skip reason=no_origin")
+            else:
+                push_result = _run_git(["push", origin, "develop"], repo_root=repo_root)
+                if push_result.returncode == 0:
+                    notes.append("push_develop=ok remote=origin")
+                else:
+                    result["ok"] = False
+                    notes.append(f"push_develop=warn remote=origin code={push_result.returncode}")
+                    _append_stderr(notes, "push_develop_stderr", push_result)
+    except subprocess.CalledProcessError as e:
+        result["ok"] = False
+        notes.append(f"sync_develop=warn reason=git_error code={e.returncode}")
+        if e.stderr:
+            notes.append(f"sync_develop_stderr={e.stderr.strip()}")
+    except FileNotFoundError:
+        result["ok"] = False
+        notes.append("sync_develop=warn reason=git_not_found")
+    finally:
+        if switched and current_branch:
+            _restore_branch(repo_root, current_branch, notes, result, "sync_develop")
+    return result
+
+
+def session_branch_advice(repo_root='.'):
+    result = {"ok": True, "allow_auto_session": False, "notes": []}
+    notes = result["notes"]
+    try:
+        current_branch = get_current_branch(repo_root=repo_root)
+        if current_branch == "develop":
+            result["allow_auto_session"] = True
+            notes.append("branch_advice=current_branch=develop auto_session=allowed")
+        elif current_branch.startswith("feat/session-"):
+            if not _branch_exists("develop", repo_root=repo_root):
+                notes.append("session_branch=active kind=temp develop=missing")
+                return result
+            ahead = _count_commits("develop", current_branch, repo_root=repo_root)
+            behind = _count_commits(current_branch, "develop", repo_root=repo_root)
+            notes.append(f"session_branch=active name={current_branch} ahead_of_develop={ahead} behind_develop={behind}")
+            if ahead > 0:
+                notes.append("session_branch_advice=unmerged_commits action=merge_to_develop_or_promote_custom_variant")
+                notes.append(f"session_branch_promote_cmd=git branch -m custom/<name> && git push -u origin custom/<name>  # current={current_branch}")
+            elif behind > 0:
+                notes.append("session_branch_advice=no_unique_commits action=checkout_develop_then_restart_for_new_session")
+            else:
+                notes.append("session_branch_advice=clean_temp_branch action=continue_or_checkout_develop_for_new_session")
+        elif current_branch.startswith("custom/") or current_branch.startswith("variant/"):
+            notes.append(f"long_lived_branch=active name={current_branch}")
+            if _branch_exists("develop", repo_root=repo_root):
+                ahead = _count_commits("develop", current_branch, repo_root=repo_root)
+                behind = _count_commits(current_branch, "develop", repo_root=repo_root)
+                notes.append(f"long_lived_branch_vs_develop=ahead:{ahead} behind:{behind}")
+                if behind > 0:
+                    notes.append("long_lived_branch_advice=manual_sync_only cmd=git merge develop  # or: git rebase develop")
+            notes.append("long_lived_branch_policy=no_auto_merge_no_auto_session")
+        elif current_branch != "develop":
+            notes.append(f"branch_advice=current_branch={current_branch} auto_session=only_when_on_develop")
+    except subprocess.CalledProcessError as e:
+        result["ok"] = False
+        notes.append(f"branch_advice=warn reason=git_error code={e.returncode}")
+        if e.stderr:
+            notes.append(f"branch_advice_stderr={e.stderr.strip()}")
+    except FileNotFoundError:
+        result["ok"] = False
+        notes.append("branch_advice=warn reason=git_not_found")
+    return result
+
+
 def repo_status(repo_root='.'):
     result = {"ok": True, "notes": []}
     notes = result["notes"]
@@ -229,8 +435,9 @@ def print_repo_status(repo_root='.'):
 
 def _main(argv=None):
     parser = argparse.ArgumentParser(description="GenericAgent startup repo guard")
-    parser.add_argument("command", nargs="?", choices=["preflight-main", "repo-status"])
+    parser.add_argument("command", nargs="?", choices=["preflight-main", "develop-sync", "preflight", "repo-status"])
     parser.add_argument("--repo-root", default='.')
+    parser.add_argument("--no-push", action="store_true", help="do not push origin/develop after develop merge")
     args = parser.parse_args(argv)
 
     if args.command == "preflight-main":
@@ -239,6 +446,25 @@ def _main(argv=None):
         print(prefix)
         for note in result.get('notes', []):
             print(f"[GA] {note}")
+        return 0
+
+    if args.command == "develop-sync":
+        result = sync_develop_with_main_if_safe(repo_root=args.repo_root, push=not args.no_push)
+        prefix = '[GA] develop 同步检查完成' if result.get('ok') else '[GA] develop 同步跳过/告警'
+        print(prefix)
+        for note in result.get('notes', []):
+            print(f"[GA] {note}")
+        return 0
+
+    if args.command == "preflight":
+        for result, ok_prefix, warn_prefix in (
+            (sync_main_if_safe(repo_root=args.repo_root), '[GA] main 同步检查完成', '[GA] main 同步跳过/告警'),
+            (sync_develop_with_main_if_safe(repo_root=args.repo_root, push=not args.no_push), '[GA] develop 同步检查完成', '[GA] develop 同步跳过/告警'),
+            (session_branch_advice(repo_root=args.repo_root), '[GA] branch 策略检查完成', '[GA] branch 策略告警'),
+        ):
+            print(ok_prefix if result.get('ok') else warn_prefix)
+            for note in result.get('notes', []):
+                print(f"[GA] {note}")
         return 0
 
     if args.command == 'repo-status':
