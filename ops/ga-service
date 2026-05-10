@@ -27,6 +27,7 @@ Usage:
   ga-service [service] <command> [args]
   ga-service <command> [args]              # defaults to service: $DEFAULT_SERVICE
   ga-service browser <command> [args]      # delegate to ops/vnc-browser
+  ga-service gitflow <status|plan|run|cleanup> [args]  # guarded no-ff merge into develop
   ga-service feishu-qr [app_id|url]        # open Feishu login/app page in VNC Chromium
   ga-service mumu-qr                       # open Mumu AI Feishu app page in VNC Chromium
 
@@ -36,12 +37,14 @@ Services:
 
 Helpers:
   browser       VNC Chromium helper (open/status/list-windows/screenshot)
+  gitflow       Guarded Git flow helper: plan/run no-ff merge into develop
   feishu-qr     Open Feishu QR login or target app page in VNC Chromium
   mumu-qr       Open Mumu AI Feishu app page in VNC Chromium
 
 Commands:
   list                                  Show manageable services
   browser <command> [args]              Control the VNC Chromium helper
+  gitflow [status|plan|run|cleanup]     Guarded no-ff merge current branch into develop
   feishu-qr [app_id|url]                Open Feishu login or target app page
   mumu-qr                               Open Mumu AI Feishu app page
   start [service]                       Start service in background
@@ -59,6 +62,8 @@ Examples:
   /home/ubuntu/tool/GenericAgent/ops/ga-service tmwd start
   /home/ubuntu/tool/GenericAgent/ops/ga-service status
   /home/ubuntu/tool/GenericAgent/ops/ga-service browser status
+  /home/ubuntu/tool/GenericAgent/ops/ga-service gitflow plan
+  /home/ubuntu/tool/GenericAgent/ops/ga-service gitflow run --yes --stay-on-target
   /home/ubuntu/tool/GenericAgent/ops/ga-service browser open https://open.feishu.cn/app
   /home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr
   /home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr cli_a979473759f85bd6
@@ -515,6 +520,14 @@ EOF
   feishu_qr_cmd cli_a979473759f85bd6
 }
 
+gitflow_helper() {
+  if [ ! -f "$REPO_ROOT/gitflow_guard.py" ]; then
+    err "Missing gitflow helper: $REPO_ROOT/gitflow_guard.py"
+    return 1
+  fi
+  python3 "$REPO_ROOT/gitflow_guard.py" --repo-root "$REPO_ROOT" "$@"
+}
+
 install_bin() {
   scope="user"
   case "${1:-}" in
@@ -623,6 +636,7 @@ main() {
     help|-h|--help) usage; return 0 ;;
     list) list_services; return 0 ;;
     browser) shift; browser_helper "$@"; return $? ;;
+    gitflow) shift; gitflow_helper "$@"; return $? ;;
     feishu-qr) shift; feishu_qr_cmd "$@"; return $? ;;
     mumu-qr) shift; mumu_qr_cmd "$@"; return $? ;;
     install-bin) shift; install_bin "$@"; return $? ;;

@@ -21,6 +21,7 @@ DEFAULT_URL="https://open.feishu.cn/app"
 DEFAULT_PROFILE_DIR="$REPO_ROOT/temp/vnc-browser-profile"
 DEFAULT_CDP_PORT="9222"
 DEFAULT_SCREENSHOT="$REPO_ROOT/temp/vnc-browser-screenshot.png"
+DEFAULT_HISTORY="$REPO_ROOT/temp/run/vnc-browser.history"
 
 BROWSER_DISPLAY="${GA_VNC_DISPLAY:-}"
 PROFILE_DIR="${GA_VNC_BROWSER_PROFILE:-$DEFAULT_PROFILE_DIR}"
@@ -44,6 +45,7 @@ Global options:
 
 Commands:
   open [URL]              Open URL in the VNC Chromium. Default: $DEFAULT_URL
+  close [--force]         Close visible VNC Chromium windows; --force also terminates matching processes.
   status                  Print detected display, VNC/noVNC ports, Chromium/CDP status.
   list-windows            List visible X windows on the selected VNC display.
   screenshot [FILE]       Capture the selected VNC display to PNG. Default: $DEFAULT_SCREENSHOT
@@ -148,25 +150,43 @@ port_is_listening() {
 cdp_json() {
   # Quick probe: if something answers on the CDP port, return its /json body.
   port="${1:-$CDP_PORT}"
-  python3 - "$port" <<'PY'
-import sys, socket, json
-port = int(sys.argv[1])
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(3)
+  python3 - "$port" <<'PY' 2>/dev/null
+import sys, urllib.request
 try:
-    s.connect(('127.0.0.1', port))
-    s.sendall(b'GET /json HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n')
-    data = b''
-    while True:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-    body = data.split(b'\\r\\n\\r\\n', 1)[1]
-    sys.stdout.buffer.write(body)
-    sys.exit(0)
-finally:
-    s.close()
+    port = int(sys.argv[1])
+    with urllib.request.urlopen(f'http://127.0.0.1:{port}/json', timeout=3) as resp:
+        sys.stdout.buffer.write(resp.read())
+except Exception:
+    sys.exit(1)
+PY
+}
+
+cdp_close_pages() {
+  # Gracefully ask Chromium DevTools HTTP endpoint to close page targets.
+  port="${1:-$CDP_PORT}"
+  python3 - "$port" <<'PY' 2>/dev/null
+import json, sys, urllib.parse, urllib.request
+try:
+    port = int(sys.argv[1])
+    with urllib.request.urlopen(f'http://127.0.0.1:{port}/json', timeout=3) as resp:
+        tabs = json.load(resp)
+except Exception:
+    sys.exit(1)
+closed = 0
+for tab in tabs:
+    if tab.get('type') != 'page':
+        continue
+    tid = (tab.get('id') or '').strip()
+    if not tid:
+        continue
+    try:
+        safe_tid = urllib.parse.quote(tid, safe='')
+        urllib.request.urlopen(f'http://127.0.0.1:{port}/json/close/{safe_tid}', timeout=3).read()
+        closed += 1
+    except Exception:
+        pass
+print(closed)
+sys.exit(0 if closed else 1)
 PY
 }
 
@@ -238,6 +258,173 @@ cdp_visible_on_display() {
 
 browser_visible_on_display() {
   [ -n "$(visible_browser_windows "${1:-}")" ]
+}
+
+cdp_page_urls() {
+  # Best-effort: include currently open HTTP(S) page tabs as recent candidates.
+  ports="$CDP_PORT"
+  port_file="$REPO_ROOT/temp/run/vnc-browser.cdp-port"
+  if [ -r "$port_file" ]; then
+    recorded_port="$(head -n 1 "$port_file" 2>/dev/null | tr -d '[:space:]')"
+    case "$recorded_port" in ''|*[!0-9]*) ;; *) ports="$ports $recorded_port" ;; esac
+  fi
+  [ "$CDP_PORT" = "$DEFAULT_CDP_PORT" ] || ports="$ports $DEFAULT_CDP_PORT"
+
+  for p in $ports; do
+    cdp_json "$p" | python3 -c '
+import json, sys
+try:
+    tabs = json.load(sys.stdin)
+except Exception:
+    tabs = []
+seen = set()
+for tab in tabs:
+    if tab.get("type") != "page":
+        continue
+    url = (tab.get("url") or "").strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        continue
+    if url in seen:
+        continue
+    seen.add(url)
+    print(url)
+' 2>/dev/null || true
+  done
+}
+
+history_recent_urls() {
+  {
+    cdp_page_urls
+    if [ -r "$DEFAULT_HISTORY" ]; then
+      cat "$DEFAULT_HISTORY"
+    fi
+  } | awk 'NF { line=$0; if (!seen[line]++) urls[++n]=line } END { for (i=1; i<=n && i<=5; i++) print urls[i] }'
+}
+
+record_history_url() {
+  url="${1:-}"
+  [ -n "$url" ] || return 0
+  case "$url" in about:blank|chrome:*|edge:*|devtools:*) return 0 ;; esac
+  mkdir -p "$(dirname "$DEFAULT_HISTORY")"
+  tmp="$DEFAULT_HISTORY.tmp.$$"
+  {
+    printf '%s\n' "$url"
+    if [ -r "$DEFAULT_HISTORY" ]; then
+      grep -Fxv -- "$url" "$DEFAULT_HISTORY" 2>/dev/null || true
+    fi
+  } | awk 'NF && !seen[$0]++ {print; count++; if (count>=50) exit}' > "$tmp"
+  mv "$tmp" "$DEFAULT_HISTORY"
+}
+
+interactive_select_urls() {
+  # Print selected URLs, one per line. Return 130 when user cancels.
+  recent="$(history_recent_urls)"
+  if [ -z "$recent" ]; then
+    printf '%s\n' "$DEFAULT_URL"
+    return 0
+  fi
+
+  printf '[vnc-browser] Recently opened URLs (newest first):\n' >&2
+  i=1
+  printf '%s\n' "$recent" | while IFS= read -r u; do
+    printf '  %s) %s\n' "$i" "$u" >&2
+    i=$((i + 1))
+  done
+  printf '  Enter) default: %s\n' "$DEFAULT_URL" >&2
+  printf '  q) cancel\n' >&2
+  printf '[vnc-browser] Select one or more numbers (e.g. 1 3, 1,3, 1-3), or type a URL: ' >&2
+
+  IFS= read -r answer || answer=""
+  case "$answer" in
+    '' ) printf '%s\n' "$DEFAULT_URL"; return 0 ;;
+    q|Q|quit|QUIT|exit|EXIT ) return 130 ;;
+  esac
+
+  RECENT_URLS="$recent" python3 - "$DEFAULT_URL" "$answer" <<'PY'
+import os, re, sys
+_default = sys.argv[1]
+answer = sys.argv[2].strip()
+recent = [line for line in os.environ.get('RECENT_URLS', '').splitlines() if line]
+
+# URL/direct input mode: any non-selection-looking text opens as a typed URL.
+if re.search(r'[A-Za-z:/]', answer):
+    print(answer)
+    raise SystemExit(0)
+
+selected = []
+invalid = []
+for token in re.split(r'[\s,]+', answer):
+    if not token:
+        continue
+    if re.fullmatch(r'\d+-\d+', token):
+        a, b = map(int, token.split('-', 1))
+        step = 1 if b >= a else -1
+        nums = range(a, b + step, step)
+    elif token.isdigit():
+        nums = [int(token)]
+    else:
+        invalid.append(token)
+        continue
+    for n in nums:
+        if 1 <= n <= len(recent):
+            url = recent[n-1]
+            if url not in selected:
+                selected.append(url)
+        else:
+            invalid.append(str(n))
+if invalid:
+    print('[vnc-browser][ERROR] Invalid selection: ' + ', '.join(invalid), file=sys.stderr)
+    raise SystemExit(2)
+for url in selected or [_default]:
+    print(url)
+PY
+}
+
+launch_browser_urls() {
+  d="$1"
+  bin="$2"
+  shift 2
+  [ "$#" -gt 0 ] || return 0
+  mkdir -p "$PROFILE_DIR" "$REPO_ROOT/temp/run"
+
+  launch_port="$CDP_PORT"
+  if port_is_listening "$launch_port"; then
+    if launch_port="$(find_free_cdp_port "$launch_port")"; then
+      log "CDP port $CDP_PORT is occupied and not reusable on DISPLAY=$d; using free port $launch_port."
+    else
+      err "CDP port $CDP_PORT is occupied and no fallback port is free."
+      return 1
+    fi
+  fi
+  CDP_PORT="$launch_port"
+  DISPLAY="$d" nohup "$bin" \
+    --no-sandbox \
+    --disable-dev-shm-usage \
+    --start-maximized \
+    --new-window \
+    --remote-debugging-address=127.0.0.1 \
+    --remote-debugging-port="$CDP_PORT" \
+    --user-data-dir="$PROFILE_DIR" \
+    "$@" >>"$REPO_ROOT/temp/vnc-browser.log" 2>&1 &
+  pid="$!"
+  printf '%s\n' "$pid" > "$REPO_ROOT/temp/run/vnc-browser.pid"
+  printf '%s\n' "$CDP_PORT" > "$REPO_ROOT/temp/run/vnc-browser.cdp-port"
+  log "Started Chromium on DISPLAY=$d pid=$pid cdp_port=$CDP_PORT urls=$#"
+  log "Log: $REPO_ROOT/temp/vnc-browser.log"
+}
+
+open_one_url() {
+  url="$1"
+  d="$2"
+  bin="$3"
+  mkdir -p "$PROFILE_DIR" "$REPO_ROOT/temp/run"
+
+  if open_via_cdp_if_available "$url" "$d"; then
+    log "Opened via visible existing CDP port $CDP_PORT on DISPLAY=$d: $url"
+  else
+    launch_browser_urls "$d" "$bin" "$url" || return $?
+  fi
+  record_history_url "$url"
 }
 
 open_via_cdp_if_available() {
@@ -376,8 +563,146 @@ screenshot_cmd() {
   printf 'screenshot=%s\n' "$file"
 }
 
+browser_window_ids() {
+  d="${1:-}"
+  [ -n "$d" ] || return 1
+  if command -v wmctrl >/dev/null 2>&1; then
+    DISPLAY="$d" wmctrl -lxp 2>/dev/null \
+      | awk 'BEGIN{IGNORECASE=1} /chromium|google-chrome|chrome/ {print $1}'
+  elif command -v xdotool >/dev/null 2>&1; then
+    DISPLAY="$d" xdotool search --onlyvisible --class 'chromium|google-chrome|chrome' 2>/dev/null || true
+  fi
+}
+
+recorded_cdp_ports() {
+  printf '%s\n' "$CDP_PORT"
+  port_file="$REPO_ROOT/temp/run/vnc-browser.cdp-port"
+  if [ -r "$port_file" ]; then
+    recorded_port="$(head -n 1 "$port_file" 2>/dev/null | tr -d '[:space:]')"
+    case "$recorded_port" in ''|*[!0-9]*) ;; *) printf '%s\n' "$recorded_port" ;; esac
+  fi
+  [ "$CDP_PORT" = "$DEFAULT_CDP_PORT" ] || printf '%s\n' "$DEFAULT_CDP_PORT"
+}
+
+managed_browser_pids() {
+  d="${1:-}"
+  if [ -n "$d" ]; then
+    visible_browser_window_pids "$d" 2>/dev/null || true
+  fi
+  recorded_cdp_ports | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    cdp_listener_pids "$p" 2>/dev/null || true
+  done
+  ps -eo pid=,args= 2>/dev/null \
+    | awk -v profile="$PROFILE_DIR" '
+        BEGIN{IGNORECASE=1}
+        /chromium|chrome/ && index($0, "--user-data-dir=" profile) {
+          gsub(/^ +/, "", $1); print $1
+        }'
+}
+
+pid_is_alive() {
+  pid="${1:-}"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  ps -p "$pid" >/dev/null 2>&1
+}
+
+close_cmd() {
+  force=0
+  dry_run=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force|-f) force=1 ;;
+      --dry-run) dry_run=1 ;;
+      -h|--help)
+        printf 'Usage: %s close [--force] [--dry-run]\n' "$SCRIPT_PATH"
+        return 0
+        ;;
+      *) err "Unknown close option: $1"; return 2 ;;
+    esac
+    shift
+  done
+
+  d="$(require_display)" || return $?
+  allow_display_local_user "$d"
+  windows="$(browser_window_ids "$d" | sort -u || true)"
+  pids="$(managed_browser_pids "$d" | sort -u || true)"
+
+  if [ -z "$windows" ] && [ -z "$pids" ]; then
+    log "No VNC Chromium windows or managed browser processes found on DISPLAY=$d."
+    return 0
+  fi
+
+  if [ -n "$windows" ]; then
+    printf '%s\n' "$windows" | sed 's/^/[vnc-browser] closing_window=/'
+    if [ "$dry_run" -eq 0 ]; then
+      printf '%s\n' "$windows" | while IFS= read -r wid; do
+        [ -n "$wid" ] || continue
+        if command -v wmctrl >/dev/null 2>&1; then
+          DISPLAY="$d" wmctrl -ic "$wid" >/dev/null 2>&1 || true
+        elif command -v xdotool >/dev/null 2>&1; then
+          DISPLAY="$d" xdotool windowclose "$wid" >/dev/null 2>&1 || true
+        fi
+      done
+    fi
+  fi
+
+  cdp_ports="$(recorded_cdp_ports | sort -u || true)"
+  if [ -n "$cdp_ports" ]; then
+    printf '%s\n' "$cdp_ports" | while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      if ! cdp_json "$p" >/dev/null 2>&1; then
+        continue
+      fi
+      printf '[vnc-browser] closing_cdp_pages_port=%s\n' "$p"
+      if [ "$dry_run" -eq 0 ]; then
+        closed="$(cdp_close_pages "$p" 2>/dev/null || true)"
+        [ -z "$closed" ] || printf '[vnc-browser] closed_cdp_pages=%s port=%s\n' "$closed" "$p"
+      fi
+    done
+  fi
+
+  if [ "$force" -eq 1 ] && [ -n "$pids" ]; then
+    printf '%s\n' "$pids" | sed 's/^/[vnc-browser] terminating_pid=/'
+    if [ "$dry_run" -eq 0 ]; then
+      printf '%s\n' "$pids" | while IFS= read -r pid; do
+        pid_is_alive "$pid" && kill -TERM "$pid" 2>/dev/null || true
+      done
+      sleep 2
+      printf '%s\n' "$pids" | while IFS= read -r pid; do
+        pid_is_alive "$pid" && kill -KILL "$pid" 2>/dev/null || true
+      done
+    fi
+  elif [ -n "$pids" ]; then
+    printf '%s\n' "$pids" | sed 's/^/[vnc-browser] matched_pid=/'
+    log "Use 'ga-service browser close --force' if any matched process remains after window close."
+  fi
+
+  if [ "$dry_run" -eq 1 ]; then
+    log "Dry run only; no windows or processes were changed."
+    return 0
+  fi
+
+  sleep 1
+  remaining_windows="$(browser_window_ids "$d" | sort -u || true)"
+  remaining_pids="$(managed_browser_pids "$d" | sort -u || true)"
+  if [ -z "$remaining_windows" ] && { [ "$force" -eq 0 ] || [ -z "$remaining_pids" ]; }; then
+    log "Closed VNC Chromium on DISPLAY=$d."
+    return 0
+  fi
+
+  [ -z "$remaining_windows" ] || printf '%s\n' "$remaining_windows" | sed 's/^/[vnc-browser] remaining_window=/'
+  [ -z "$remaining_pids" ] || printf '%s\n' "$remaining_pids" | sed 's/^/[vnc-browser] remaining_pid=/'
+  if [ "$force" -eq 0 ]; then
+    log "Window close requested; processes may exit after Chromium finishes shutdown."
+    return 0
+  fi
+  err "Some browser windows/processes are still present after force close."
+  return 1
+}
+
 open_cmd() {
-  url="${1:-$DEFAULT_URL}"
+  explicit_url="${1:-}"
   d="$(require_display)" || return $?
   allow_display_local_user "$d"
   bin="$(browser_bin 2>/dev/null || true)"
@@ -385,35 +710,56 @@ open_cmd() {
     err "Chromium executable not found in PATH."
     return 1
   fi
-  mkdir -p "$PROFILE_DIR" "$REPO_ROOT/temp/run"
 
-  if open_via_cdp_if_available "$url" "$d"; then
-    log "Opened via visible existing CDP port $CDP_PORT on DISPLAY=$d: $url"
-  else
-    launch_port="$CDP_PORT"
-    if port_is_listening "$launch_port"; then
-      if launch_port="$(find_free_cdp_port "$launch_port")"; then
-        log "CDP port $CDP_PORT is occupied and not reusable on DISPLAY=$d; using free port $launch_port."
-      else
-        err "CDP port $CDP_PORT is occupied and no fallback port is free."
-        return 1
+  if [ -n "$explicit_url" ]; then
+    urls="$explicit_url"
+  elif [ -t 0 ]; then
+    mkdir -p "$REPO_ROOT/temp/run"
+    select_tmp="$(mktemp "$REPO_ROOT/temp/run/vnc-browser-select.XXXXXX")"
+    interactive_select_urls >"$select_tmp"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      rm -f "$select_tmp"
+      if [ "$rc" -eq 130 ]; then
+        log "Open cancelled by user."
+        return 0
       fi
+      return "$rc"
     fi
-    CDP_PORT="$launch_port"
-    DISPLAY="$d" nohup "$bin" \
-      --no-sandbox \
-      --disable-dev-shm-usage \
-      --start-maximized \
-      --new-window \
-      --remote-debugging-address=127.0.0.1 \
-      --remote-debugging-port="$CDP_PORT" \
-      --user-data-dir="$PROFILE_DIR" \
-      "$url" >>"$REPO_ROOT/temp/vnc-browser.log" 2>&1 &
-    pid="$!"
-    printf '%s\n' "$pid" > "$REPO_ROOT/temp/run/vnc-browser.pid"
-    printf '%s\n' "$CDP_PORT" > "$REPO_ROOT/temp/run/vnc-browser.cdp-port"
-    log "Started Chromium on DISPLAY=$d pid=$pid cdp_port=$CDP_PORT url=$url"
-    log "Log: $REPO_ROOT/temp/vnc-browser.log"
+    urls="$(cat "$select_tmp")"
+    rm -f "$select_tmp"
+  else
+    urls="$DEFAULT_URL"
+  fi
+
+  url_args=()
+  while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    url_args+=("$url")
+  done <<< "$urls"
+
+  if [ "${#url_args[@]}" -eq 0 ]; then
+    err "No URL selected."
+    return 2
+  fi
+
+  launch_args=()
+  for url in "${url_args[@]}"; do
+    if open_via_cdp_if_available "$url" "$d"; then
+      log "Opened via visible existing CDP port $CDP_PORT on DISPLAY=$d: $url"
+      record_history_url "$url"
+    elif open_via_recorded_cdp_if_available "$url" "$d"; then
+      record_history_url "$url"
+    else
+      launch_args+=("$url")
+    fi
+  done
+
+  if [ "${#launch_args[@]}" -gt 0 ]; then
+    launch_browser_urls "$d" "$bin" "${launch_args[@]}" || return $?
+    for url in "${launch_args[@]}"; do
+      record_history_url "$url"
+    done
   fi
 
   # Give the window manager a moment, then show evidence.
@@ -444,7 +790,8 @@ cmd="${1:-help}"
 [ "$#" -gt 0 ] && shift || true
 
 case "$cmd" in
-  open) open_cmd "${1:-$DEFAULT_URL}" ;;
+  open) open_cmd "${1:-}" ;;
+  close|quit) close_cmd "$@" ;;
   status) status_cmd ;;
   list-windows|windows) list_windows_cmd ;;
   screenshot) screenshot_cmd "${1:-$DEFAULT_SCREENSHOT}" ;;
