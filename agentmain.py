@@ -195,6 +195,12 @@ if __name__ == '__main__':
     parser.add_argument('--llm_no', type=int, default=0)
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--nobg', action='store_true')
+    parser.add_argument(
+        '--reply-wait-seconds',
+        type=int,
+        default=int(os.environ.get('GA_TASK_REPLY_WAIT_SECONDS', '0')),
+        help='一次性任务完成后等待 reply.txt 的秒数；默认0表示写出结果后立即退出'
+    )
     args = parser.parse_args()
 
     if args.task and not args.nobg:
@@ -244,10 +250,17 @@ if __name__ == '__main__':
                     with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
             with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
             consume_file(d, '_stop')  # 已经成功停下来了，避免打断下次reply
-            for _ in range(300):  # 等reply.txt，10分钟超时
-                time.sleep(2)
-                if (raw := consume_file(d, 'reply.txt')): break
-            else: break
+            wait_seconds = max(0, int(args.reply_wait_seconds or 0))
+            if wait_seconds <= 0:
+                break
+            deadline = time.time() + wait_seconds
+            raw = None
+            while time.time() < deadline:
+                time.sleep(min(2, max(0.1, deadline - time.time())))
+                if (raw := consume_file(d, 'reply.txt')):
+                    break
+            if not raw:
+                break
             nround = nround + 1 if isinstance(nround, int) else 1
     elif args.reflect:
         agent.peer_hint = False
