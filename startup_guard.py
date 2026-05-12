@@ -137,6 +137,11 @@ def sync_main_if_safe(repo_root='.'):
             return result
         notes.append(f"main_remote={remote}")
 
+        if not clean:
+            notes.append("sync_main=skip reason=dirty_worktree")
+            notes.append("fetch=skip reason=dirty_worktree")
+            return result
+
         fetch = _run_git(["fetch", "--all", "--prune"], repo_root=repo_root)
         if fetch.returncode != 0:
             result["ok"] = False
@@ -144,10 +149,6 @@ def sync_main_if_safe(repo_root='.'):
             stderr = (fetch.stderr or "").strip()
             if stderr:
                 notes.append(f"fetch_stderr={stderr}")
-            return result
-
-        if not clean:
-            notes.append("sync_main=skip reason=dirty_worktree")
             return result
 
         if not _branch_exists("main", repo_root=repo_root):
