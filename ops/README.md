@@ -17,6 +17,7 @@ Helper commands:
 
 - `browser`: VNC Chromium helper, backed by `ops/vnc-browser`; it defaults to the real VNC display `:1` instead of an inherited SSH display such as `localhost:11.0`.
 - `gitflow`: Guarded helper for merging the current/session branch into local `develop` with `git merge --no-ff`.
+- `tui`: Shortcut for starting the foreground GenericAgent terminal UI via the existing `ga start` launcher.
 - `feishu-qr`: Open the default Feishu login/QR page or a target Feishu app page in VNC Chromium.
 - `mumu-qr`: Shortcut alias for the Mumu AI Feishu app (`cli_a979473759f85bd6`).
 

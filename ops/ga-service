@@ -30,6 +30,7 @@ Usage:
   ga-service gitflow <status|plan|run|cleanup> [args]  # guarded no-ff merge into develop
   ga-service feishu-qr [app_id|url]        # open Feishu login/app page in VNC Chromium
   ga-service mumu-qr                       # open Mumu AI Feishu app page in VNC Chromium
+  ga-service tui [-- args...]              # start GenericAgent foreground terminal UI
 
 Services:
   wechat        GA WeChat customer-service frontend (frontends/wechatapp.py)
@@ -38,6 +39,7 @@ Services:
 Helpers:
   browser       VNC Chromium helper (open/status/list-windows/screenshot)
   gitflow       Guarded Git flow helper: plan/run no-ff merge into develop
+  tui           Start GenericAgent foreground terminal UI (agentmain.py)
   feishu-qr     Open Feishu QR login or target app page in VNC Chromium
   mumu-qr       Open Mumu AI Feishu app page in VNC Chromium
 
@@ -528,6 +530,29 @@ gitflow_helper() {
   python3 "$REPO_ROOT/gitflow_guard.py" --repo-root "$REPO_ROOT" "$@"
 }
 
+tui_cmd() {
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<EOF
+Usage:
+  ga-service tui [-- args...]
+
+Behavior:
+  Start GenericAgent in the foreground terminal UI, equivalent to:
+  ga start [args...]
+
+Notes:
+  This is a ga-service shortcut only; it does not modify the separate ga launcher.
+EOF
+    return 0
+  fi
+  if ! command -v ga >/dev/null 2>&1; then
+    err "ga launcher not found in PATH"
+    return 1
+  fi
+  log "Starting GenericAgent terminal UI via ga launcher..."
+  exec ga start "$@"
+}
+
 install_bin() {
   scope="user"
   case "${1:-}" in
@@ -637,6 +662,7 @@ main() {
     list) list_services; return 0 ;;
     browser) shift; browser_helper "$@"; return $? ;;
     gitflow) shift; gitflow_helper "$@"; return $? ;;
+    tui) shift; tui_cmd "$@"; return $? ;;
     feishu-qr) shift; feishu_qr_cmd "$@"; return $? ;;
     mumu-qr) shift; mumu_qr_cmd "$@"; return $? ;;
     install-bin) shift; install_bin "$@"; return $? ;;
