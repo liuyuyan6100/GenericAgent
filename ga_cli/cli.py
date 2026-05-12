@@ -73,9 +73,9 @@ COMMANDS = {
         "cmd": ["python", "{FRONTENDS}/desktop_pet_v2.pyw"],
     },
     "tui": {
-        "help": "启动终端 TUI (tuiapp)",
-        "desc": "启动终端图形界面（Textual），适合纯终端环境或 SSH",
-        "cmd": ["python", "{FRONTENDS}/tuiapp.py"],
+        "help": "启动终端 TUI v2 (tuiapp_v2)",
+        "desc": "启动新版终端图形界面（Textual，多会话），适合纯终端环境或 SSH",
+        "cmd": ["python", "{FRONTENDS}/tuiapp_v2.py"],
     },
     "cli": {
         "help": "启动 CLI 对话 (agentmain)",
