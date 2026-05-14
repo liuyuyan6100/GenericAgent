@@ -20,9 +20,35 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from itertools import count
 from typing import Any, Callable, Optional
+
+
+def _configure_terminal_environment() -> None:
+    """Best-effort terminal defaults for UTF-8, truecolor and predictable TUI rendering.
+
+    不强行覆盖用户显式配置，只补齐缺省/退化值；同时把子进程继承的
+    环境也调整到 UTF-8/truecolor，减少中文、emoji 和 ANSI 颜色在终端里
+    被错误解码或降级的概率。
+    """
+    if (os.environ.get("TERM") or "").lower() in ("", "dumb"):
+        os.environ["TERM"] = "xterm-256color"
+    os.environ.setdefault("COLORTERM", "truecolor")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    if not any(os.environ.get(k) for k in ("LC_ALL", "LC_CTYPE")):
+        lang = os.environ.get("LANG")
+        if not lang or lang.upper() in ("C", "POSIX"):
+            os.environ["LANG"] = "C.UTF-8"
+    for stream in (getattr(sys, "stdin", None), getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_configure_terminal_environment()
 
 try:
     from rich.markdown import Markdown
@@ -47,8 +73,46 @@ except ModuleNotFoundError as exc:
 _ANSI_CONTROL_RE = re.compile(
     r"\x1b\[\?[\d;]*[hl]"      # 私有模式: ?2004h / ?25l ...
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC: 标题 / 超链接
-    r"|\x1b[=>]"               # 键盘模式切换
+    r"|\x1b\](?:[^\x07\x1b]|\x1b(?!\\))*(?:\x07|\x1b\\|$)"  # 容错 OSC
+    r"|\x1b\[(?![0-9;:]*m)[0-?]*[ -/]*[@-~]"  # 非 SGR CSI，保留颜色 SGR
+    r"|\x1b[=>78MDEHc]"       # 键盘/字符集/光标类单字节控制
 )
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
+
+
+def _strip_unsafe_controls(text: str, *, keep_sgr: bool = True) -> str:
+    """清理会破坏 TUI 状态的控制序列，同时保留可显示文本和可选 SGR 颜色。"""
+    if not text:
+        return ""
+    cleaned = _ANSI_CONTROL_RE.sub("", text)
+    if not keep_sgr:
+        cleaned = re.sub(r"\x1b\[[0-9;:]*m", "", cleaned)
+    return _CONTROL_CHARS_RE.sub("", cleaned)
+
+
+def _cell_width(text: str) -> int:
+    """返回终端单元宽度；CJK 全角/宽字符按 2，组合符和变体选择符按 0。"""
+    width = 0
+    for ch in text or "":
+        o = ord(ch)
+        if ch in "\n\r\t":
+            width += 1 if ch == "\t" else 0
+        elif unicodedata.combining(ch) or 0xFE00 <= o <= 0xFE0F:
+            continue
+        elif unicodedata.east_asian_width(ch) in ("F", "W") or (0x1F300 <= o <= 0x1FAFF):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _wrapped_line_count(text: str, columns: int) -> int:
+    """按终端单元宽度估算软换行行数，补 Textual 对中文/emoji 宽度的偏差。"""
+    columns = max(1, int(columns or 1))
+    total = 0
+    for line in (text or "").split("\n") or [""]:
+        total += max(1, (_cell_width(line) + columns - 1) // columns)
+    return total
 
 
 def fold_turns(text: str) -> list[dict]:
@@ -1096,7 +1160,12 @@ class GenericAgentTUI(App[None]):
         else:
             sidebar.remove_class("-narrow")
             sidebar.styles.width = max(30, min(50, w // 5))
-        main.styles.padding = (1, 2) if w < 90 else (1, 6)
+        if w < 70:
+            main.styles.padding = (0, 1)
+        elif w < 90:
+            main.styles.padding = (1, 2)
+        else:
+            main.styles.padding = (1, 6)
         # padding 改完 layout 是异步重算；推迟到下一帧再读 #messages.content_region 取新宽
         self.call_after_refresh(self._remount_current_session)
 
@@ -1136,12 +1205,20 @@ class GenericAgentTUI(App[None]):
             self._hide_palette()
 
     def _resize_input(self, inp: TextArea) -> None:
-        # wrapped_document.height 才是含软换行的可见行数；document.line_count 只数逻辑行
+        # wrapped_document.height 是 Textual 的可见行数；再用终端 cell 宽度估算 CJK/emoji
+        # 软换行，避免中文宽字符导致输入框高度不足或光标位置跳动。
         try:
             lines = inp.wrapped_document.height or inp.document.line_count
         except Exception:
             lines = inp.document.line_count
-        inp.styles.height = min(max(lines, 1), 3) + 2  # +2 = padding 1 2 的上下边
+        try:
+            content_width = inp.content_region.width or inp.size.width or 1
+            # TextArea 左右 padding 为 2；保守扣除，窄终端至少保留 8 列。
+            usable_width = max(8, int(content_width) - 4)
+            lines = max(lines, _wrapped_line_count(inp.text or "", usable_width))
+        except Exception:
+            pass
+        inp.styles.height = min(max(lines, 1), 4) + 2  # +2 = padding 1 2 的上下边
 
     def on_input_area_submitted(self, event: "InputArea.Submitted") -> None:
         inp = event.input_area
@@ -1693,7 +1770,7 @@ class GenericAgentTUI(App[None]):
         """渲染 Markdown 时用的列宽：取 #messages 的实际 content 宽度，避免 120 死宽留白。"""
         try:
             w = self.query_one("#messages", VerticalScroll).content_region.width
-            return max(40, w)
+            return max(24, min(140, w))
         except Exception:
             return 100
 
@@ -1706,7 +1783,7 @@ class GenericAgentTUI(App[None]):
             return m._cached_body
         suffix = "" if m.done else " …"
         raw = m.content or ""
-        cleaned = _ANSI_CONTROL_RE.sub("", raw)
+        cleaned = _strip_unsafe_controls(raw, keep_sgr=True)
         if self.fold_mode:
             cleaned = render_folded_text(cleaned)
         text = cleaned + suffix
@@ -1749,11 +1826,11 @@ class GenericAgentTUI(App[None]):
         if m.kind == "choice":  # selected_label is not None
             body = Text(); body.append("✓ ", style=C_GREEN); body.append(m.selected_label, style=C_FG)
         elif m.role == "user":
-            body = Text(); body.append("> ", style=C_DIM); body.append(m.content, style=C_FG)
+            body = Text(); body.append("> ", style=C_DIM); body.append(_strip_unsafe_controls(m.content, keep_sgr=False), style=C_FG)
             for path in m.image_paths:
                 body.append(f"\n📎 {path}", style=C_MUTED)
         elif m.role == "system":
-            body = Text(m.content, style=C_MUTED)
+            body = Text(_strip_unsafe_controls(m.content, keep_sgr=False), style=C_MUTED)
         else:
             body = self._build_assistant_body(m)
         m._body_widget = SelectableStatic(body, classes="msg")
