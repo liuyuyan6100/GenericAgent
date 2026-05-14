@@ -39,7 +39,7 @@ Services:
 Helpers:
   browser       VNC Chromium helper (open/status/list-windows/screenshot)
   gitflow       Guarded Git flow helper: plan/run no-ff merge into develop
-  tui           Start GenericAgent foreground terminal UI (agentmain.py)
+  tui           Start GenericAgent foreground terminal UI (frontends/tuiapp_v2.py)
   feishu-qr     Open Feishu QR login or target app page in VNC Chromium
   mumu-qr       Open Mumu AI Feishu app page in VNC Chromium
 
@@ -537,20 +537,21 @@ Usage:
   ga-service tui [-- args...]
 
 Behavior:
-  Start GenericAgent in the foreground terminal UI, equivalent to:
-  ga start [args...]
+  Start GenericAgent TUI v2 in the foreground, equivalent to:
+  python3 frontends/tuiapp_v2.py [args...]
 
 Notes:
   This is a ga-service shortcut only; it does not modify the separate ga launcher.
 EOF
     return 0
   fi
-  if ! command -v ga >/dev/null 2>&1; then
-    err "ga launcher not found in PATH"
+  if [ ! -f "$REPO_ROOT/frontends/tuiapp_v2.py" ]; then
+    err "TUI v2 entry not found: $REPO_ROOT/frontends/tuiapp_v2.py"
     return 1
   fi
-  log "Starting GenericAgent terminal UI via ga launcher..."
-  exec ga start "$@"
+  log "Starting GenericAgent TUI v2 via python3 frontends/tuiapp_v2.py..."
+  cd "$REPO_ROOT" || return 1
+  exec python3 frontends/tuiapp_v2.py "$@"
 }
 
 install_bin() {
