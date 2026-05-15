@@ -368,8 +368,11 @@ class InputArea(TextArea):
         Binding("ctrl+j",      "newline", "Newline", show=False),
         Binding("ctrl+enter",  "newline", "Newline", show=False),
         Binding("shift+enter", "newline", "Newline", show=False),
-        # Ctrl+V 优先尝试系统图片剪贴板；无图片时再走 Textual 文本剪贴板。
-        Binding("ctrl+v",      "paste", "Paste", show=False),
+        # 兼容常见终端粘贴快捷键：Ctrl+V / Ctrl+Shift+V / Shift+Insert。
+        # 统一优先尝试系统图片剪贴板；无图片时再走 Textual 文本剪贴板。
+        Binding("ctrl+v",        "paste", "Paste", show=False),
+        Binding("ctrl+shift+v",  "paste", "Paste", show=False),
+        Binding("shift+insert",  "paste", "Paste", show=False),
         # Ctrl+U: Unix 终端约定的 "kill line"，此处复用为整框清空（无选区时）。
         # 跨平台一致：Windows ConPTY / macOS Terminal / Linux 各家终端均原生支持 Ctrl+U 键码。
         Binding("ctrl+u",      "clear_input", "ClearInput", show=False),
