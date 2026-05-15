@@ -337,6 +337,15 @@ class AgentChatMixin:
 
 
 from agentmain import GeneraticAgent as _GA
-from continue_cmd import handle_frontend_command as _handle_continue_frontend, install as _install_continue, reset_conversation as _reset_conversation
+try:
+    from frontends.continue_cmd import (
+        handle_frontend_command as _handle_continue_frontend,
+        install as _install_continue,
+        reset_conversation as _reset_conversation,
+    )
+    from frontends.btw_cmd import handle_frontend_command as _handle_btw_frontend, install as _install_btw
+except ModuleNotFoundError:
+    from continue_cmd import handle_frontend_command as _handle_continue_frontend, install as _install_continue, reset_conversation as _reset_conversation
+    from btw_cmd import handle_frontend_command as _handle_btw_frontend, install as _install_btw
 _install_continue(_GA)
-from btw_cmd import handle_frontend_command as _handle_btw_frontend, install as _install_btw; _install_btw(_GA)
+_install_btw(_GA)

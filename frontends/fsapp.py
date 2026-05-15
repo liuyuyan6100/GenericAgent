@@ -3,9 +3,9 @@ import glob, json, os, queue as Q, re, sys, threading, time
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
-from agentmain import GeneraticAgent
 from frontends.chatapp_common import format_restore
 from frontends.continue_cmd import handle_frontend_command as handle_continue_frontend, reset_conversation
+from custom.feishu_session_runtime import FeishuSessionManager
 from llmcore import mykeys
 
 import traceback
@@ -235,8 +235,7 @@ ALLOWED_USERS = _to_allowed_set(mykeys.get("fs_allowed_users", []))
 PUBLIC_ACCESS = not ALLOWED_USERS or "*" in ALLOWED_USERS
 AGENT_TIMEOUT_SEC = 900
 
-agent = GeneraticAgent()
-threading.Thread(target=agent.run, daemon=True).start()
+session_manager = FeishuSessionManager(PROJECT_ROOT)
 client, user_tasks = None, {}
 
 
@@ -599,12 +598,16 @@ def handle_message(data):
     if message.message_type == "text" and user_input.startswith("/"):
         return handle_command(open_id, user_input, chat_id)
 
+    runtime = session_manager.get(open_id)
+    agent = runtime.agent
+
     def run_agent():
-        user_tasks[open_id] = {"running": True}
+        task_id = f"fs_{open_id}_{time.time_ns()}"
+        user_tasks[open_id] = {"running": True, "task_id": task_id}
         receive_id = chat_id or open_id
         rid_type = "chat_id" if chat_id else "open_id"
         done_event = threading.Event()
-        hook_key = f"fs_{open_id}"
+        hook_key = task_id
         card = _TaskCard(receive_id, rid_type)
         card.start()
         on_final = lambda raw: _send_generated_files(receive_id, raw, receive_id_type=rid_type)
@@ -614,7 +617,8 @@ def handle_message(data):
             agent.put_task(user_input, source="feishu", images=image_paths)
             start = time.time()
             while not done_event.wait(timeout=3):
-                if not user_tasks.get(open_id, {}).get("running", True):
+                state = user_tasks.get(open_id, {})
+                if state.get("task_id") != task_id or not state.get("running", True):
                     agent.abort()
                     card.fail("已停止")
                     break
@@ -627,12 +631,16 @@ def handle_message(data):
             card.fail(f"错误: {e}")
         finally:
             agent._turn_end_hooks.pop(hook_key, None)
-            user_tasks.pop(open_id, None)
+            if user_tasks.get(open_id, {}).get("task_id") == task_id:
+                user_tasks.pop(open_id, None)
 
     threading.Thread(target=run_agent, daemon=True).start()
 
 
 def handle_command(open_id, cmd, chat_id=None):
+    runtime = session_manager.get(open_id)
+    agent = runtime.agent
+
     def _send_cmd_response(content):
         if chat_id:
             send_message(chat_id, content, receive_id_type="chat_id")
@@ -646,7 +654,7 @@ def handle_command(open_id, cmd, chat_id=None):
         agent.abort()
         _send_cmd_response("正在停止...")
     elif op == "/new":
-        _send_cmd_response(reset_conversation(agent))
+        _send_cmd_response(runtime.reset_conversation())
     elif op == "/help":
         _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/help - 显示帮助")
     elif op == "/status":
@@ -665,17 +673,11 @@ def handle_command(open_id, cmd, chat_id=None):
         _send_cmd_response("LLMs:\n" + "\n".join(lines))
     elif op == "/restore":
         try:
-            restored_info, err = format_restore()
-            if err:
-                return _send_cmd_response(err.replace("❌ ", ""))
-            restored, fname, count = restored_info
-            agent.history.extend(restored)
-            agent.abort()
-            _send_cmd_response(f"已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)")
+            _send_cmd_response(runtime.restore_latest().replace("❌ ", ""))
         except Exception as e:
             _send_cmd_response(f"恢复失败: {e}")
     elif op == "/continue" or cmd.startswith("/continue"):
-        _send_cmd_response(handle_continue_frontend(agent, cmd))
+        _send_cmd_response(runtime.handle_continue(cmd))
     else:
         _send_cmd_response(f"未知命令: {cmd}")
 
