@@ -16,6 +16,7 @@ import argparse
 import os
 import queue
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -303,11 +304,27 @@ def _read_clipboard_text() -> str:
         import tkinter as tk
         r = tk.Tk(); r.withdraw()
         try:
-            return r.clipboard_get() or ""
+            text = r.clipboard_get() or ""
+            if text:
+                return text
         finally:
             r.destroy()
     except Exception:
-        return ""
+        pass
+
+    try:
+        proc = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout or ""
+    except Exception:
+        pass
+    return ""
 
 
 def _save_clipboard_image() -> Optional[str]:
