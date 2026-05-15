@@ -16,6 +16,7 @@ import argparse
 import os
 import queue
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -298,6 +299,34 @@ class SelectableStatic(Static):
 
 
 
+def _read_clipboard_text() -> str:
+    try:
+        import tkinter as tk
+        r = tk.Tk(); r.withdraw()
+        try:
+            text = r.clipboard_get() or ""
+            if text:
+                return text
+        finally:
+            r.destroy()
+    except Exception:
+        pass
+
+    try:
+        proc = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-o"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return proc.stdout or ""
+    except Exception:
+        pass
+    return ""
+
+
 def _save_clipboard_image() -> Optional[str]:
     """Best-effort cross-platform clipboard image import; returns a PNG path or None."""
     try:
@@ -389,14 +418,30 @@ class InputArea(TextArea):
         self._insert_via_keyboard(f"[Image #{sid}]")
         return True
 
+    def _insert_paste_text(self, text: str) -> None:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        line_count = len(text.splitlines()) or 1
+        if line_count > 2:
+            self._paste_counter += 1
+            sid = self._paste_counter
+            self._pastes[sid] = text
+            text = f"[Pasted text #{sid} +{line_count} lines]"
+        self._insert_via_keyboard(text)
+
     def action_paste(self) -> None:
         if self.read_only or self._paste_image_from_clipboard():
             return
-        if clipboard := getattr(self.app, "clipboard", ""):
-            self._insert_via_keyboard(clipboard)
+        text = _read_clipboard_text() or getattr(self.app, "clipboard", "")
+        if text:
+            self._insert_paste_text(text)
 
     def action_paste_image(self) -> None:
         self._paste_image_from_clipboard()
+
+    async def _on_click(self, event: events.Click) -> None:
+        if getattr(event, "button", 0) == 3 and not self.read_only:
+            self.action_paste()
+            event.stop(); event.prevent_default()
 
     class Submitted(Message):
         def __init__(self, input_area: "InputArea", value: str) -> None:
