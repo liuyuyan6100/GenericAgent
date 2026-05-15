@@ -22,6 +22,7 @@ dist/
 Thumbs.db
 
 *.log
+logs/*.jsonl
 .env
 auth.json
 model_responses.txt

@@ -298,14 +298,38 @@ def _record_usage(usage, api_mode):
     if api_mode == 'responses':
         cached = (usage.get("input_tokens_details") or {}).get("cached_tokens", 0)
         inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
         print(f"[Cache] input={inp} cached={cached}")
     elif api_mode == 'chat_completions':
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         inp = usage.get("prompt_tokens", 0)
+        out = usage.get("completion_tokens", 0)
         print(f"[Cache] input={inp} cached={cached}")
     elif api_mode == 'messages':
         ci, cr, inp = usage.get("cache_creation_input_tokens", 0), usage.get("cache_read_input_tokens", 0), usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        cached = cr
         print(f"[Cache] input={inp} creation={ci} read={cr}")
+    else:
+        inp, out, cached = 0, 0, 0
+
+    # Persist usage to log file for token_stats.py
+    try:
+        import os, json as _json, time
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        record = {
+            "timestamp": time.time(),
+            "input_tokens": inp or 0,
+            "output_tokens": out or 0,
+            "cache_read_tokens": cached or 0,
+            "api_mode": api_mode,
+        }
+        log_file = os.path.join(log_dir, "token_usage.jsonl")
+        with open(log_file, "a") as f:
+            f.write(_json.dumps(record) + "\n")
+    except Exception:
+        pass  # Never break the main flow
     
 def _parse_openai_json(data, api_mode="chat_completions"):
     blocks = []
