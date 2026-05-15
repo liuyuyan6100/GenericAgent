@@ -1,0 +1,8 @@
+# Candidate selectors for Web WeChat. These are probed defensively because
+# Web WeChat DOM varies by domain/version/account state.
+selectors:
+  login_qr: ["img.qrcode", ".qrcode img", "canvas"]
+  chat_list: [".chat_item", "[ng-repeat*='chat']", "[role='listitem']"]
+  message_items: [".message", ".bubble", "[data-message-id]"]
+  input_box: ["#editArea", "[contenteditable='true']", "textarea"]
+  send_button: [".btn_send", "button[type='submit']", "button"]

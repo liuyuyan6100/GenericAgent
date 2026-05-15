@@ -1,0 +1,4 @@
+# Simple keyword replies used by the MVP responder.
+items:
+  - keywords: ["帮助", "help", "菜单"]
+    reply: "您好，我是 GA 网页微信助手。当前处于观察/测试阶段。"
