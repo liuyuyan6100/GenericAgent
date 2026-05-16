@@ -22,6 +22,7 @@ dist/
 Thumbs.db
 
 *.log
+logs/
 .env
 auth.json
 model_responses.txt
@@ -32,6 +33,7 @@ mykey.py
 tasks/
 
 *.zip
+*.exe
 
 memory/*
 !memory/memory_management_sop.md
