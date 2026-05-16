@@ -28,6 +28,9 @@ Usage:
   ga-service <command> [args]              # defaults to service: $DEFAULT_SERVICE
   ga-service browser <command> [args]      # delegate to ops/vnc-browser
   ga-service gitflow <status|plan|run|cleanup> [args]  # guarded no-ff merge into develop
+  ga-service repo-status                   # inspect repo/main sync state (read-only)
+  ga-service repo-sync [--push]            # sync main/develop explicitly before merge
+  ga-service repo-finish -m "change points" [--push]   # sync + merge current branch into develop + cleanup
   ga-service feishu-qr [app_id|url]        # open Feishu login/app page in VNC Chromium
   ga-service mumu-qr                       # open Mumu AI Feishu app page in VNC Chromium
   ga-service tui [-- args...]              # start GenericAgent foreground terminal UI
@@ -39,6 +42,9 @@ Services:
 Helpers:
   browser       VNC Chromium helper (open/status/list-windows/screenshot)
   gitflow       Guarded Git flow helper: plan/run no-ff merge into develop
+  repo-status   Print startup_guard repo-status for this repo
+  repo-sync     Run startup_guard preflight (default: --no-push) to sync main/develop
+  repo-finish   Sync main/develop, merge current branch into develop, then cleanup merged branch
   tui           Start GenericAgent foreground terminal UI (frontends/tuiapp_v2.py)
   feishu-qr     Open Feishu QR login or target app page in VNC Chromium
   mumu-qr       Open Mumu AI Feishu app page in VNC Chromium
@@ -47,6 +53,9 @@ Commands:
   list                                  Show manageable services
   browser <command> [args]              Control the VNC Chromium helper
   gitflow [status|plan|run|cleanup]     Guarded no-ff merge current branch into develop
+  repo-status                           Show repo/main sync status (read-only)
+  repo-sync [--push]                    Sync main/develop explicitly before merging session work
+  repo-finish -m "change points" [--push] Sync + merge current branch into develop + delete merged local branch
   feishu-qr [app_id|url]                Open Feishu login or target app page
   mumu-qr                               Open Mumu AI Feishu app page
   start [service]                       Start service in background
@@ -66,6 +75,9 @@ Examples:
   /home/ubuntu/tool/GenericAgent/ops/ga-service browser status
   /home/ubuntu/tool/GenericAgent/ops/ga-service gitflow plan
   /home/ubuntu/tool/GenericAgent/ops/ga-service gitflow run --yes --stay-on-target
+  /home/ubuntu/tool/GenericAgent/ops/ga-service repo-status
+  /home/ubuntu/tool/GenericAgent/ops/ga-service repo-sync
+  /home/ubuntu/tool/GenericAgent/ops/ga-service repo-finish -m "ga-service: add repo status/sync/finish helpers"
   /home/ubuntu/tool/GenericAgent/ops/ga-service browser open https://open.feishu.cn/app
   /home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr
   /home/ubuntu/tool/GenericAgent/ops/ga-service feishu-qr cli_a979473759f85bd6
@@ -224,6 +236,7 @@ start_service() {
   require_service "$svc" || return 2
   ensure_dirs
   check_prereq "$svc" || return 1
+  maybe_repo_status_hint
   if is_running "$svc"; then
     pid="$(service_pid "$svc")"
     log "$(service_label "$svc") already running (pid=$pid)"
@@ -530,6 +543,176 @@ gitflow_helper() {
   python3 "$REPO_ROOT/gitflow_guard.py" --repo-root "$REPO_ROOT" "$@"
 }
 
+startup_guard_helper() {
+  if [ ! -f "$REPO_ROOT/startup_guard.py" ]; then
+    err "Missing startup guard helper: $REPO_ROOT/startup_guard.py"
+    return 1
+  fi
+  py="$REPO_ROOT/.venv/bin/python"
+  if [ ! -x "$py" ]; then py="python3"; fi
+  (
+    cd "$REPO_ROOT" || exit 1
+    "$py" startup_guard.py --repo-root "$REPO_ROOT" "$@"
+  )
+}
+
+maybe_repo_status_hint() {
+  if [ ! -f "$REPO_ROOT/startup_guard.py" ]; then
+    return 0
+  fi
+  status_output="$(startup_guard_helper repo-status 2>/dev/null)" || return 0
+  repo_ok="$(printf '%s\n' "$status_output" | sed -n 's/^repo_ok=//p' | head -n 1)"
+  sync_state="$(printf '%s\n' "$status_output" | sed -n 's/^repo_main_sync=//p' | head -n 1)"
+  current_branch="$(printf '%s\n' "$status_output" | sed -n 's/^repo_current_branch=//p' | head -n 1)"
+  worktree_clean="$(printf '%s\n' "$status_output" | sed -n 's/^repo_worktree_clean=//p' | head -n 1)"
+  if [ "${repo_ok:-yes}" = "yes" ] && [ "${sync_state:-}" = "up_to_date" ]; then
+    return 0
+  fi
+  if [ -z "${sync_state:-}" ]; then sync_state="unknown"; fi
+  if [ -z "${current_branch:-}" ]; then current_branch="unknown"; fi
+  if [ -z "${worktree_clean:-}" ]; then worktree_clean="unknown"; fi
+  log "⚠ repo status before start: main_sync=$sync_state branch=$current_branch clean=$worktree_clean — inspect: ga-service repo-status; sync: ga-service repo-sync"
+}
+
+repo_status_cmd() {
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<EOF
+Usage:
+  ga-service repo-status
+
+Behavior:
+  Print startup_guard.py repo-status for the current repo.
+  Read-only; does not switch branches or write git state.
+EOF
+    return 0
+  fi
+  if [ "$#" -ne 0 ]; then
+    err "repo-status does not accept extra args"
+    return 2
+  fi
+  startup_guard_helper repo-status
+}
+
+repo_sync_cmd() {
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<EOF
+Usage:
+  ga-service repo-sync [--push]
+
+Behavior:
+  Run startup_guard.py preflight to sync local main with upstream main,
+  then sync develop with main.
+
+Options:
+  --push   allow startup_guard to push origin/develop after sync
+
+Notes:
+  Default behavior is local-only and passes --no-push.
+  The repo worktree must be clean; no implicit stash/cleanup is performed.
+EOF
+    return 0
+  fi
+  push_flag="no"
+  if [ "${1:-}" = "--push" ]; then
+    push_flag="yes"
+    shift
+  fi
+  if [ "$#" -ne 0 ]; then
+    err "Unknown repo-sync args: $*"
+    return 2
+  fi
+  log "Running repo sync (preflight main/develop, push=$push_flag)..."
+  if [ "$push_flag" = "yes" ]; then
+    startup_guard_helper preflight
+  else
+    startup_guard_helper --no-push preflight
+  fi
+}
+
+repo_finish_cmd() {
+  if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<EOF
+Usage:
+  ga-service repo-finish -m "concrete change points" [--push]
+
+Behavior:
+  1. Run ga-service repo-sync
+  2. Merge the current branch into develop via gitflow_guard.py run --yes --stay-on-target
+  3. Cleanup the merged local branch via gitflow_guard.py cleanup --yes
+
+Options:
+  -m, --message   required merge commit message with concrete change points
+  --push          also allow pushing origin/develop during sync and merge
+
+Notes:
+  Must be run from a feature/session branch, not main/develop.
+  The repo worktree must be clean; no implicit stash/cleanup is performed.
+EOF
+    return 0
+  fi
+
+  current_branch="$(cd "$REPO_ROOT" && git rev-parse --abbrev-ref HEAD 2>/dev/null)" || {
+    err "Failed to detect current git branch at $REPO_ROOT"
+    return 1
+  }
+  case "$current_branch" in
+    ''|HEAD)
+      err "repo-finish requires a named branch, not detached HEAD"
+      return 2
+      ;;
+    main|develop)
+      err "repo-finish must run from a feature/session branch; current branch is $current_branch"
+      return 2
+      ;;
+  esac
+
+  push_flag="no"
+  merge_message=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --push)
+        push_flag="yes"
+        shift
+        ;;
+      -m|--message)
+        if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+          err "Missing value for $1"
+          return 2
+        fi
+        merge_message="$2"
+        shift 2
+        ;;
+      *)
+        err "Unknown repo-finish arg: $1"
+        return 2
+        ;;
+    esac
+  done
+
+  if [ -z "$merge_message" ]; then
+    err "repo-finish requires -m/--message with concrete change points"
+    return 2
+  fi
+
+  log "Repo finish: syncing main/develop before merge..."
+  if [ "$push_flag" = "yes" ]; then
+    repo_sync_cmd --push || return $?
+  else
+    repo_sync_cmd || return $?
+  fi
+
+  log "Repo finish: merging $current_branch into develop..."
+  if [ "$push_flag" = "yes" ]; then
+    gitflow_helper --source "$current_branch" --target develop --yes --push --stay-on-target -m "$merge_message" run || return $?
+  else
+    gitflow_helper --source "$current_branch" --target develop --yes --stay-on-target -m "$merge_message" run || return $?
+  fi
+
+  log "Repo finish: cleaning up merged branch $current_branch..."
+  gitflow_helper --source "$current_branch" --target develop --yes cleanup || return $?
+  log "Repo finish complete: $current_branch -> develop"
+}
+
 tui_cmd() {
   if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     cat <<EOF
@@ -663,6 +846,9 @@ main() {
     list) list_services; return 0 ;;
     browser) shift; browser_helper "$@"; return $? ;;
     gitflow) shift; gitflow_helper "$@"; return $? ;;
+    repo-status) shift; repo_status_cmd "$@"; return $? ;;
+    repo-sync) shift; repo_sync_cmd "$@"; return $? ;;
+    repo-finish) shift; repo_finish_cmd "$@"; return $? ;;
     tui) shift; tui_cmd "$@"; return $? ;;
     feishu-qr) shift; feishu_qr_cmd "$@"; return $? ;;
     mumu-qr) shift; mumu_qr_cmd "$@"; return $? ;;
@@ -698,7 +884,8 @@ main() {
     stop) stop_service "$svc" ;;
     restart) restart_service "$svc" ;;
     status)
-      if [ "$svc" = "all" ]; then status_service wechat; printf '\n'; status_service tmwd; else status_service "$svc"; fi
+      if [ "$svc" = "all" ]; then status_service wechat; printf '
+'; status_service tmwd; else status_service "$svc"; fi
       ;;
     logs) logs_service "$svc" "$@" ;;
     qr) qr_service "$svc" ;;
