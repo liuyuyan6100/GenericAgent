@@ -1,0 +1,55 @@
+# GA Web WeChat bot configuration.
+# Persistent artifacts intentionally stay under ops/wechat_web_bot/.
+mode: observe  # observe | semi-auto | auto
+wechat:
+  urls:
+    - "https://wx.qq.com/"
+    - "https://web.wechat.com/"
+  target_groups_file: "data/allowed_groups.yaml"
+  selectors_file: "data/selectors.yaml"
+
+reply:
+  faq_file: "data/faq.yaml"
+  default_reply: "收到，我稍后回复。"
+  cooldown_seconds: 20
+  max_replies_per_minute: 6
+  require_group_allowlist: true
+
+logging:
+  level: "INFO"
+  base_dir: "logs"
+  max_total_mb: 1024
+  app_log:
+    path: "bot.log"
+    max_mb: 20
+    backup_count: 10
+    compress: true
+  runner_log:
+    path: "runner.log"
+    max_mb: 10
+    backup_count: 5
+    compress: true
+  error_log:
+    path: "errors.log"
+    max_mb: 20
+    backup_count: 10
+    compress: true
+  messages:
+    dir: "messages"
+    retention_days: 30
+    compress_after_days: 1
+    redact_sensitive: true
+  screenshots:
+    dir: "screenshots"
+    retention_days: 7
+    max_files: 200
+    max_total_mb: 300
+  dom_snapshots:
+    dir: "dom_snapshots"
+    retention_days: 7
+    max_files: 100
+    max_total_mb: 300
+  gc:
+    run_on_start: true
+    interval_hours: 24
+    dry_run_default: false
