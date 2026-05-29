@@ -553,11 +553,18 @@ def _describe_media(msg_type, file_path, filename):
     return f"[{msg_type}]\n[File: source: {file_path}]"
 
 
+# Extensions that Feishu API can actually accept as file/image/media uploads.
+_SENDABLE_EXTS = _IMAGE_EXTS | _AUDIO_EXTS | _VIDEO_EXTS | set(_FILE_TYPE_MAP.keys())
+
+
 def _send_local_file(receive_id, file_path, receive_id_type="open_id"):
     if not os.path.isfile(file_path):
-        send_message(receive_id, f"⚠️ 文件不存在: {file_path}", receive_id_type=receive_id_type)
         return False
     ext = os.path.splitext(file_path)[1].lower()
+    # Skip file types that Feishu API cannot handle (e.g. .py, .json, .md, .yaml).
+    # They remain as text references in the message body — no upload attempted.
+    if ext not in _SENDABLE_EXTS:
+        return False
     if ext in _IMAGE_EXTS:
         image_key = _upload_image_sync(file_path)
         if image_key:
@@ -569,6 +576,7 @@ def _send_local_file(receive_id, file_path, receive_id_type="open_id"):
             msg_type = "media" if ext in _AUDIO_EXTS or ext in _VIDEO_EXTS else "file"
             send_message(receive_id, json.dumps({"file_key": file_key}, ensure_ascii=False), msg_type=msg_type, receive_id_type=receive_id_type)
             return True
+    # Upload was attempted but failed for a supported type → notify user
     send_message(receive_id, f"⚠️ 文件发送失败: {os.path.basename(file_path)}", receive_id_type=receive_id_type)
     return False
 
