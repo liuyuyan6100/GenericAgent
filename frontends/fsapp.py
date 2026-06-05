@@ -745,7 +745,8 @@ class FeishuApp(AgentChatMixin):
         await asyncio.to_thread(_send_generated_files, rid, raw_text, receive_id_type)
 
     async def run_agent(self, chat_id, text, *, receive_id=None, receive_id_type="open_id", images=None, **_):
-        if self.user_tasks:
+        if chat_id in self.user_tasks:
+            print(f"[Feishu] blocked duplicate task for chat_id={chat_id}; active_chats={list(self.user_tasks.keys())}")
             await self.send_text(chat_id, "当前会话已有任务在运行，请等待完成或发送 /stop 后再试。", receive_id=receive_id, receive_id_type=receive_id_type)
             return
         state = {"running": True}
