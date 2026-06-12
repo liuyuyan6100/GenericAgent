@@ -88,10 +88,6 @@ memory/L4_raw_sessions/*
 # Morphling SOP
 !memory/morphling_sop.md
 
-# Skill Search SOP
-!memory/skill_search/
-!memory/skill_search/**
-
 
 # ADB UI tool
 !memory/adb_ui.py
@@ -147,3 +143,6 @@ frontends/conductor_im_plugins/config.local.json
 **/__pycache__/
 
 .claude/
+# Project Mode SOP
+!memory/project_mode_sop.md
+
