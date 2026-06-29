@@ -1,4 +1,4 @@
-import os, sys, threading, queue, time, json, re, random, locale
+import os, sys, threading, queue, time, json, re, random, locale, glob
 os.environ.setdefault('GA_LANG', 'zh' if any(k in (locale.getlocale()[0] or '').lower() for k in ('zh', 'chinese')) else 'en')
 if sys.stdout is None: sys.stdout = open(os.devnull, "w")
 elif hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(errors='replace')
@@ -68,6 +68,8 @@ class GenericAgent:
         logid = f'{(time.time_ns() + random.randrange(1_000_000)) % 1_000_000:06d}'
         self.log_path = os.path.join(script_dir, f'temp/model_responses/model_responses_{logid}.txt')
         self.load_llm_sessions()
+        self.extra_sys_prompts = []
+        self.intervene = self.extrakeyinfo = None
 
     def load_llm_sessions(self):
         mykeys, changed = reload_mykeys()
@@ -154,8 +156,7 @@ class GenericAgent:
                 raw_query = f'Long user prompt saved to {task_file}. Read and execute.'
             rquery = smart_format(raw_query.replace('\n', ' '), max_str_len=200)
             self.history.append(f"[USER]: {rquery}")
-            
-            sys_prompt = get_system_prompt() + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
+            sys_prompt = get_system_prompt() + '\n'.join(self.extra_sys_prompts) + getattr(self.llmclient.backend, 'extra_sys_prompt', '')
             if self.peer_hint: sys_prompt += f"\n[Peer] 用户提及其他会话/后台任务状态时: temp/model_responses/ (只找近期修改的文件尾部)\n"
             handler = GenericAgentHandler(self, self.history, os.path.join(script_dir, 'temp'))
             if getattr(self, 'no_print', False): handler.print = lambda *a, **k: None
@@ -170,7 +171,7 @@ class GenericAgent:
                 self.llmclient.backend.stream = False
                 self.llmclient.backend.read_timeout = max(self.llmclient.backend.read_timeout, 1200)
             gen = agent_runner_loop(self.llmclient, sys_prompt, raw_query, handler, TOOLS_SCHEMA, 
-                                    max_turns=80, verbose=self.verbose, yield_info=True)
+                                    max_turns=180, verbose=self.verbose, yield_info=True)
             try:
                 full_resp = ""; last_pos = 0; curr_turn = 0; turn_resps = []
                 for chunk in gen:
@@ -186,8 +187,6 @@ class GenericAgent:
                 if self.inc_out and last_pos < len(full_resp):
                     display_queue.put({'next': full_resp[last_pos:], 'source': source,
                                     'turn': curr_turn, 'outputs': turn_resps[-2:]})
-                #if '</summary>' in full_resp: full_resp = full_resp.replace('</summary>', '</summary>\n\n')
-                #if '</file_content>' in full_resp: full_resp = re.sub(r'<file_content>\s*(.*?)\s*</file_content>', r'\n````\n<file_content>\n\1\n</file_content>\n````', full_resp, flags=re.DOTALL)                
                 display_queue.put({'done': full_resp, 'source': source, 'turn': curr_turn, 'outputs': turn_resps.copy()})
                 self.history = handler.history_info
             except Exception as e:
@@ -212,9 +211,11 @@ if __name__ == '__main__':
     import argparse
     from datetime import datetime
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', metavar='IODIR', help='一次性任务模式(文件IO)')
+    parser.add_argument('--task', metavar='IODIR', help='一次性任务模式，先看subagent.md')
+    parser.add_argument('--func', metavar='PROMPT_FILE', help='纯函数模式：读prompt文件→结果写prompt.out.txt→退出')
     parser.add_argument('--reflect', metavar='SCRIPT', help='反射模式：加载监控脚本，check()触发时发任务')
     parser.add_argument('--input', help='prompt')
+    parser.add_argument('--history', help='history json file')
     parser.add_argument('--llm_no', type=int, default=0)
     parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--nobg', action='store_true')
@@ -224,17 +225,21 @@ if __name__ == '__main__':
         default=int(os.environ.get('GA_TASK_REPLY_WAIT_SECONDS', '0')),
         help='一次性任务完成后等待 reply.txt 的秒数；默认0表示写出结果后立即退出'
     )
+    parser.add_argument('--nolog', action='store_true')
     args, _unknown = parser.parse_known_args()
-    _reflect_args = dict(zip([k.lstrip('-') for k in _unknown[::2]], _unknown[1::2])) if _unknown else {}
+    _extra_args = dict(zip([k.lstrip('-') for k in _unknown[::2]], _unknown[1::2])) if _unknown else {}
 
-    if args.task and not args.nobg:
+    if (args.func or args.task) and not args.nobg:
         import subprocess, platform
         cmd = [sys.executable, os.path.abspath(__file__)] + [a for a in sys.argv[1:]] + ['--nobg']
-        d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
+        if args.task:
+            d = os.path.join(script_dir, f'temp/{args.task}'); os.makedirs(d, exist_ok=True)
+            out = open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8')
+            err = open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8')
+        else: out, err = subprocess.DEVNULL, subprocess.DEVNULL
         p = subprocess.Popen(cmd, cwd=script_dir,
             creationflags=0x08000000 if platform.system() == 'Windows' else 0,
-            stdout=open(os.path.join(d, 'stdout.log'), 'w', encoding='utf-8'),
-            stderr=open(os.path.join(d, 'stderr.log'), 'w', encoding='utf-8'))
+            stdout=out, stderr=err)
         print('PID:', p.pid); sys.exit(0)
 
     main_preflight = sync_main_if_safe(script_dir)
@@ -252,28 +257,37 @@ if __name__ == '__main__':
     else:
         print('[GA] auto_session=skip reason=branch_policy')
 
-    agent = GeneraticAgent()
+    agent = GenericAgent()
+    if args.nolog:
+        agent.log_path = False
     agent.next_llm(args.llm_no)
     agent.verbose = args.verbose
     threading.Thread(target=agent.run, daemon=True).start()
 
+    histfile = args.history
     if args.task:
-        agent.peer_hint = False
-        agent.force_non_stream = True
         agent.task_dir = d = os.path.join(script_dir, f'temp/{args.task}'); nround = ''
-        infile = os.path.join(d, 'input.txt')
+        infile = os.path.join(d, 'input.txt'); outfile = f'{d}/output{nround}.txt'
         if args.input:
             os.makedirs(d, exist_ok=True)
-            import glob; [os.remove(f) for f in glob.glob(os.path.join(d, 'output*.txt'))]
+            [os.remove(f) for f in glob.glob(os.path.join(d, 'output*.txt'))]
             with open(infile, 'w', encoding='utf-8') as f: f.write(args.input)
-        if (fh := consume_file(d, '_history.json')): agent.llmclient.backend.history = json.loads(fh)
+        histfile = histfile or os.path.join(d, '_history.json')
+    elif args.func:
+        infile = args.func; outfile = os.path.splitext(args.func)[0] + '.out.txt'
+
+    if histfile and os.path.isfile(histfile): agent.llmclient.backend.history = json.loads(open(histfile, encoding='utf-8').read())
+
+    if args.func or args.task:
+        agent.peer_hint = False
         with open(infile, encoding='utf-8') as f: raw = f.read()
         while True:
-            dq = agent.put_task(raw, source='task')
-            while 'done' not in (item := dq.get(timeout=1200)): 
-                if 'next' in item and random.random() < 0.95:  # 概率写一次中间结果
-                    with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
-            with open(f'{d}/output{nround}.txt', 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
+            dq = agent.put_task(raw, source='func' if args.func else 'task')
+            while 'done' not in (item := dq.get(timeout=2200)):
+                if 'next' in item:
+                    with open(outfile, 'w', encoding='utf-8') as f: f.write(item.get('next', ''))
+            with open(outfile, 'w', encoding='utf-8') as f: f.write(item['done'] + '\n\n[ROUND END]\n')
+            if not args.task: break
             consume_file(d, '_stop')  # 已经成功停下来了，避免打断下次reply
             wait_seconds = max(0, int(args.reply_wait_seconds or 0))
             if wait_seconds <= 0:
@@ -287,20 +301,20 @@ if __name__ == '__main__':
             if not raw:
                 break
             nround = nround + 1 if isinstance(nround, int) else 1
+            outfile = f'{d}/output{nround}.txt'
     elif args.reflect:
         agent.peer_hint = False
-        agent.force_non_stream = True
         import importlib.util
         spec = importlib.util.spec_from_file_location('reflect_script', args.reflect)
         mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-        if hasattr(mod, 'init'): mod.init(_reflect_args)
+        if hasattr(mod, 'init'): mod.init(_extra_args)
         _mt = os.path.getmtime(args.reflect)
-        print(f'[Reflect] loaded {args.reflect}' + (f' args={_reflect_args}' if _reflect_args else ''))
+        print(f'[Reflect] loaded {args.reflect}' + (f' args={_extra_args}' if _extra_args else ''))
         while True:
             if os.path.getmtime(args.reflect) != _mt:
                 try:
                     spec.loader.exec_module(mod); _mt = os.path.getmtime(args.reflect)
-                    if hasattr(mod, 'init'): mod.init(_reflect_args)
+                    if hasattr(mod, 'init'): mod.init(_extra_args)
                     print('[Reflect] reloaded')
                 except Exception as e: print(f'[Reflect] reload error: {e}')
             try: task = mod.check()
@@ -311,7 +325,7 @@ if __name__ == '__main__':
                 print(f'[Reflect] triggered: {task[:80]}')
                 dq = agent.put_task(task, source='reflect')
                 try:
-                    while 'done' not in (item := dq.get(timeout=1200)): pass
+                    while 'done' not in (item := dq.get(timeout=2200)): pass
                     result = item['done']
                     print(result)
                 except Exception as e:
@@ -347,5 +361,4 @@ if __name__ == '__main__':
                     if 'next' in item: print(item['next'], end='', flush=True)
                     if 'done' in item: print(); break
             except KeyboardInterrupt:
-                agent.abort()
-                print('\n[Interrupted]')
+                agent.abort(); print('\n[Interrupted]')

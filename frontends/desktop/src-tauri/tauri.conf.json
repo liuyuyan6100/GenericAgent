@@ -17,6 +17,7 @@
         "width": 1280,
         "height": 800,
         "resizable": true,
+        "maximized": false,
         "visible": false,
         "url": "loading.html"
       },
