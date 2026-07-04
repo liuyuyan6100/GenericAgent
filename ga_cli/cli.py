@@ -29,6 +29,10 @@ def launch_frontend(cmd_parts, args=None):
         part = part.replace("{REFLECT}", _reflect())
         full_cmd.append(part)
 
+    # 替换 python 占位符为当前解释器，避免 PATH 解析到错误的 Python
+    if full_cmd and full_cmd[0].lower() == "python":
+        full_cmd[0] = sys.executable
+
     # 插入额外参数
     if args:
         full_cmd.extend(args)
