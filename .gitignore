@@ -1,3 +1,8 @@
+# Portable runtime (uv, Python, Git) installed by ga_install.ps1
+.portable/
+env.cmd
+env.ps1
+
 temp/
 tmp/
 .portable/
@@ -57,6 +62,7 @@ memory/L4_raw_sessions/*
 !memory/ljqCtrl_sop.md
 !memory/macljqCtrl.py
 !memory/computer_use.md
+!memory/ljqCtrlBg.py
 
 # procmem_scanner related tools
 !memory/procmem_scanner.py
