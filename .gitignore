@@ -1,3 +1,8 @@
+# Portable runtime (uv, Python, Git) installed by ga_install.ps1
+.portable/
+env.cmd
+env.ps1
+
 temp/
 tmp/
 
